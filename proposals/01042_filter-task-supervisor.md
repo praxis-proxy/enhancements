@@ -179,14 +179,6 @@ contract, credential refresh, IMDS, and OIDC each
 get another thread the pipeline cannot reliably
 kill.
 
-One filter does not by itself justify new core API.
-A second copy of a thread-per-filter runtime
-*does*: token refresh, IMDS, OIDC federation, and
-any other watch-or-refresh filter will otherwise
-each own a thread that Drop may fail to join,
-leaking secrets. The missing lifecycle is the
-cause. The overlay thread is a workaround that
-should not become the contract.
 
 ### User Stories
 
