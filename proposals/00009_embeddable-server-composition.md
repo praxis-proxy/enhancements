@@ -12,6 +12,7 @@ graduation_criteria:
   - Synchronous, side-effect-free factory contract reviewed
   - Pipeline extension ownership and reload semantics reviewed
   - Integration with Async Pipeline Activation agreed
+  - Candidate activation teardown semantics reviewed
   - Runtime policy publication and atomicity semantics reviewed
   - Offline validation and dump behavior defined
   - Backward-compatibility and migration plan reviewed
@@ -38,6 +39,11 @@ Downstream distributions must be able to provide:
 - Distribution-specific configuration defaults, CLI integration,
   and branding.
 
+Distribution defaults are limited to the configuration source and
+application metadata used when operator input is absent. Explicit
+operator configuration and CLI values always take precedence. The
+composition boundary cannot rewrite parsed operator configuration.
+
 Praxis must retain ownership of:
 
 - Pipeline resolution, validation, activation, and publication.
@@ -45,6 +51,12 @@ Praxis must retain ownership of:
 - Listener and health-check lifecycle.
 - Server-managed runtime resources and policies.
 - Offline validation and effective-configuration dumping.
+
+Currently known server-managed state includes shared subrequest
+clients and their safety limits, health-check state, the KV store
+registry, and listener pipeline handles. Distribution-specific stores
+and caches remain pipeline-scoped resources. This boundary does not
+make restart-only connector, listener, or TLS settings reloadable.
 
 Startup, reload, validation, and dump must use the same
 composition inputs. Validation and dump resolve and validate the
@@ -61,6 +73,18 @@ generation. Failed resolution or activation must publish none of
 them. Server-managed policy must remain current for every listener
 that continues serving, including listeners whose removal requires
 a restart.
+
+If activation fails after partial success, all candidate-owned
+resources acquired for the unpublished generation must be released
+before the failure is returned. Async Pipeline Activation must define
+teardown ownership, ordering, and error handling; composition must
+reuse that lifecycle rather than create a second one.
+
+Composition is the static host boundary, not a plugin loader. Plugins
+remain a separate, startup-only Praxis extension surface: composition
+inputs are established before pipeline resolution, while plugin
+loading and dispatch follow the plugin proposal and do not participate
+in dynamic pipeline reload.
 
 Existing server entry points must remain supported.
 
