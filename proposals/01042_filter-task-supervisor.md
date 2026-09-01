@@ -171,14 +171,6 @@ just an ugly implementation:
   pipeline.” Tests have to stub a fake handle so
   construction does not spawn a real thread.
 
-A thread is justified for an inotify loop that
-must not sit on a Pingora worker. It is not
-justified as the default way a filter stays alive
-between requests. Once that is the copy-paste
-contract, credential refresh, IMDS, and OIDC each
-get another thread the pipeline cannot reliably
-kill.
-
 
 ### User Stories
 
