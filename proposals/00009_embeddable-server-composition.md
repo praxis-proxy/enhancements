@@ -108,7 +108,7 @@ Existing server entry points must remain supported.
 
 ### Non-goals
 
-- A general-purpose plugin framework.
+- A general-purpose framework for Praxis plugins
 - Arbitrary downstream mutation of resolved pipelines.
 - Redefining Async Pipeline Activation.
 - Moving downstream filter or application types into Praxis.
