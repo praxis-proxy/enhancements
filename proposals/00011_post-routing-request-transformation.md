@@ -9,7 +9,7 @@ authors:
   - leseb
 graduation_criteria:
   - Post-routing transformation lifecycle and ownership semantics defined
-  - Cluster application-protocol configuration and context propagation reviewed
+  - Cluster application-protocol and provider metadata propagation reviewed
   - Canonical buffered-body mutation, framing, and body-limit behavior defined
   - Standard HTTP and iterative_request_router lifecycle parity agreed
   - Compatibility and no-buffering behavior for existing filters defined
@@ -34,11 +34,12 @@ Allow a filter to transform a buffered HTTP request after
 Praxis has selected its upstream cluster, but before the
 request is sent upstream.
 
-Clusters may declare an optional, opaque application-level
-protocol, such as `openai_responses` or
-`openai_chat_completions`, shared by every endpoint in the
-cluster. The selected value must remain available through
-the filter context for the complete HTTP exchange.
+Clusters may declare optional, opaque application-level
+protocol and provider metadata, such as
+`openai_responses` and `openai`. Every endpoint in a cluster
+shares these values. The selected values must remain
+available through the filter context for the complete HTTP
+exchange.
 
 Filters may opt into bounded, mutable access to the
 canonical buffered body after upstream selection and before
@@ -53,13 +54,20 @@ Responses request unchanged to a native Responses backend,
 or translate it when routing selects a backend that only
 supports Chat Completions.
 
+Provider metadata also distinguishes native OpenAI from a
+compatible backend using the same protocol. For native
+OpenAI, provider-owned fields such as `conversation` and
+`previous_response_id` must pass through unchanged so that
+OpenAI remains responsible for validating conflicts and
+existence.
+
 This keeps validation, rehydration, storage, and
 agentic-loop state independent of the backend protocol.
 
 ### Goals
 
 - Represent and expose the selected cluster's application
-  protocol.
+  protocol and provider identity.
 - Support bounded post-selection request transformation.
 - Provide equivalent behavior for normal and iterative
   exchanges.
@@ -70,7 +78,8 @@ agentic-loop state independent of the backend protocol.
 
 - Implement OpenAI or provider-specific translation in
   Praxis core.
-- Detect protocols by probing upstream endpoints.
+- Infer provider identity from an endpoint address or detect
+  protocols by probing upstream endpoints.
 - Allow endpoints within one cluster to use different
   application protocols.
 - Introduce a routing policy or cross-protocol retry.
@@ -90,6 +99,12 @@ Praxis AI exposes this gap when one Responses pipeline can
 route to either a native Responses backend or a Chat
 Completions-only backend. Translation is required only in
 the latter case, after the cluster is known.
+
+Protocol alone is not enough for provider-specific behavior:
+native OpenAI and compatible backends may both implement the
+Responses protocol. Explicit provider metadata lets filters
+preserve provider-owned fields for native OpenAI without
+assuming that its endpoint address is `api.openai.com`.
 
 Two protocol-specific pipelines work for static mappings,
 but duplicate stateful Responses configuration and cannot
@@ -112,7 +127,7 @@ requests and `iterative_request_router` exchanges.
   stateful configuration.
 
 - As a filter author, I want to adapt the upstream body from
-  the selected cluster's application protocol.
+  the selected cluster's application protocol and provider.
 
 - As an agentic-loop user, I want internal inference
   exchanges to use the same routing and translation contract
