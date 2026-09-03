@@ -34,38 +34,18 @@ Allow a filter to transform a buffered HTTP request after
 Praxis has selected its upstream cluster, but before the
 request is sent upstream.
 
-Upstream clusters may expose an optional application-level
-protocol identifier. This identifier describes the API
-protocol shared by every endpoint in the cluster, rather
-than the HTTP transport protocol used to reach it.
+Clusters may declare an optional, opaque application-level
+protocol, such as `openai_responses` or
+`openai_chat_completions`, shared by every endpoint in the
+cluster. The selected value must remain available through
+the filter context for the complete HTTP exchange.
 
-Examples include:
-
-- `openai_responses`
-- `openai_chat_completions`
-- `anthropic_messages`
-
-Praxis core treats these values as opaque identifiers.
-Application-specific filters define which identifiers they
-understand and how they affect request or response
-processing.
-
-Once routing and load balancing select a cluster, its
-application protocol must be available through the filter
-context for the remainder of the HTTP exchange.
-
-Filters that require it must also be able to opt into
-bounded, mutable access to the canonical buffered request
-body after upstream selection and before transport. Their
-changes must be the bytes forwarded upstream.
-
-The capability must have equivalent semantics in the
-standard HTTP proxy lifecycle and in each internal exchange
-executed by `iterative_request_router`.
-
-Filters that do not opt into post-routing transformation
-must retain their existing lifecycle and must not cause
-additional request buffering.
+Filters may opt into bounded, mutable access to the
+canonical buffered body after upstream selection and before
+transport. The standard HTTP lifecycle and each
+`iterative_request_router` exchange must provide the same
+contract. Filters that do not opt in retain their current
+lifecycle without additional buffering.
 
 The initial consumer is the OpenAI Responses pipeline in
 Praxis AI. A single pipeline should be able to send a
@@ -73,37 +53,27 @@ Responses request unchanged to a native Responses backend,
 or translate it when routing selects a backend that only
 supports Chat Completions.
 
-The shared Responses lifecycle, including validation,
-rehydration, storage, and agentic-loop state, must remain
-independent of the selected backend protocol.
+This keeps validation, rehydration, storage, and
+agentic-loop state independent of the backend protocol.
 
 ### Goals
 
-- Represent the application protocol shared by a cluster's
-  endpoints.
-- Make the selected application protocol available to
-  filters for the complete upstream exchange.
-- Support bounded request transformation after upstream
-  selection and before transport.
-- Preserve one stateful application pipeline across
-  heterogeneous upstream protocols.
-- Provide the same lifecycle contract for normal requests
-  and iterative request-router exchanges.
+- Represent and expose the selected cluster's application
+  protocol.
+- Support bounded post-selection request transformation.
+- Provide equivalent behavior for normal and iterative
+  exchanges.
 - Preserve existing behavior and fast paths for filters
-  that do not use the capability.
+  that do not opt in.
 
 ### Non-goals
 
 - Implement OpenAI or provider-specific translation in
   Praxis core.
-- Automatically detect protocols by probing upstream
-  endpoints.
+- Detect protocols by probing upstream endpoints.
 - Allow endpoints within one cluster to use different
   application protocols.
-- Replace or introduce a routing policy.
-- Reorder the existing request-body pre-read phase.
-- Define cross-protocol retry or fallback after an upstream
-  attempt has started.
+- Introduce a routing policy or cross-protocol retry.
 - Require every Praxis cluster to declare an application
   protocol.
 
