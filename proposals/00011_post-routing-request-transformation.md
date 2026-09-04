@@ -21,6 +21,7 @@ experimental_exempt: true
 experimental_exempt_reason: Core lifecycle changes cannot be prototyped as an external filter.
 related:
   - https://github.com/praxis-proxy/ai/issues/35
+  - https://github.com/praxis-proxy/ai/issues/924
   - https://github.com/orgs/praxis-proxy/discussions/1070
   - https://github.com/orgs/praxis-proxy/discussions/840
   - https://github.com/orgs/praxis-proxy/discussions/777
@@ -30,23 +31,25 @@ related:
 
 ## What?
 
-Allow a filter to transform a buffered HTTP request after
-Praxis has selected its upstream cluster, but before the
-request is sent upstream.
+Enable one HTTP filter pipeline to route requests to upstream
+clusters with different application protocols while ensuring
+each selected upstream receives the representation it
+supports.
 
-Clusters may declare optional, opaque application-level
-protocol and provider metadata, such as
-`openai_responses` and `openai`. Every endpoint in a cluster
-shares these values. The selected values must remain
-available through the filter context for the complete HTTP
-exchange.
+Clusters may declare optional, opaque application-protocol
+and provider identifiers, such as `openai_responses` and
+`openai`. Every endpoint in a cluster shares these values.
+Application filters can use the selected upstream metadata to
+preserve or adapt the outbound request before transport.
+Existing pipelines that do not require adaptation retain
+their current behavior.
 
-Filters may opt into bounded, mutable access to the
-canonical buffered body after upstream selection and before
-transport. The standard HTTP lifecycle and each
-`iterative_request_router` exchange must provide the same
-contract. Filters that do not opt in retain their current
-lifecycle without additional buffering.
+Within `iterative_request_router`, adaptation is isolated to
+each exchange and starts from that iteration's canonical
+body. Adapted bytes from one exchange do not become the
+source for another. Retaining the selected inference backend
+across model rounds is tracked separately in
+[Inference backend binding across IRR model rounds].
 
 The initial consumer is the OpenAI Responses pipeline in
 Praxis AI. A single pipeline should be able to send a
@@ -68,9 +71,14 @@ agentic-loop state independent of the backend protocol.
 
 - Represent and expose the selected cluster's application
   protocol and provider identity.
-- Support bounded post-selection request transformation.
-- Provide equivalent behavior for normal and iterative
-  exchanges.
+- Support routing-dependent adaptation only for request
+  bodies already buffered within the effective request-body
+  limit, and reject transformed bodies that exceed that limit
+  before upstream transport.
+- Provide the same selection and adaptation ordering,
+  selected-cluster metadata, body-limit enforcement, HTTP
+  framing, and failure behavior for normal requests and every
+  iterative exchange.
 - Preserve existing behavior and fast paths for filters
   that do not opt in.
 
@@ -79,12 +87,35 @@ agentic-loop state independent of the backend protocol.
 - Implement OpenAI or provider-specific translation in
   Praxis core.
 - Infer provider identity from an endpoint address or detect
-  protocols by probing upstream endpoints.
+  protocols by probing upstream endpoints. Addresses are not
+  stable provider identifiers, and probing would add network
+  I/O, inference token costs, and failure modes for facts that
+  operators already know when configuring a cluster.
 - Allow endpoints within one cluster to use different
-  application protocols.
-- Introduce a routing policy or cross-protocol retry.
+  application protocols. A transport retry may select another
+  endpoint without restoring the canonical request or rerunning
+  application-level transformation. Mixed-protocol endpoints
+  could therefore receive a path and body encoded for another
+  protocol. Each application protocol must be configured as a
+  separate cluster.
+- Introduce a routing policy or cross-protocol retry. Routing
+  remains responsible for upstream selection; retrying across
+  protocols would also require restoring the original body
+  and applying a different transformation.
 - Require every Praxis cluster to declare an application
-  protocol.
+  protocol. The metadata remains optional for unrelated
+  clusters, while a pipeline containing a filter that depends
+  on it must fail configuration validation when a selectable
+  cluster omits it.
+
+### Options under consideration
+
+- A dedicated request-transformation callback after upstream
+  selection.
+- Transformation integrated into routing or upstream
+  selection.
+- Another lifecycle mechanism that provides the same
+  metadata, isolation, and transport guarantees.
 
 ## Why?
 
@@ -137,6 +168,7 @@ requests and `iterative_request_router` exchanges.
 
 - [Post-routing request transformation discussion]
 - [Responses to Chat Completions filter]
+- [Inference backend binding across IRR model rounds]
 - [API translation for non-Anthropic providers]
 - [Provider fallback for same-format inference endpoints]
 - [Pipeline Continuations]
@@ -145,6 +177,8 @@ requests and `iterative_request_router` exchanges.
   https://github.com/orgs/praxis-proxy/discussions/1071
 [Responses to Chat Completions filter]:
   https://github.com/praxis-proxy/ai/issues/35
+[Inference backend binding across IRR model rounds]:
+  https://github.com/praxis-proxy/ai/issues/924
 [API translation for non-Anthropic providers]:
   https://github.com/orgs/praxis-proxy/discussions/1070
 [Provider fallback for same-format inference endpoints]:
