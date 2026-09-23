@@ -39,17 +39,6 @@ merged_from:
 
 # Stateful Proxy State Management and Storage Layer
 
-> **Merge note:** This proposal merges the former ENH #99
-> (Stateful Proxy State Management) and ENH #412 (Storage
-> Layer). #412 tracked the pluggable backend traits beneath
-> #99's state model and was on hold; its content is folded
-> in here and it is superseded by this proposal. Part 1 is
-> the state model and typed domain APIs (from #99). Part 2
-> is the unified state interface and the storage backend
-> traits (from #99's interface section and #412). One point
-> where the two source proposals disagreed is flagged inline
-> under "SQL as a storage backend".
-
 ## Part 1: State Model
 
 ## What?
@@ -230,9 +219,8 @@ certificate management, or desired configuration state.
   and support graceful degradation with recovery rather
   than silent latency creep or hard failures.
 
-> **Note:** Detailed requirements and design should be
-> added in a follow-up proposal update after the state
-> model and motivation are accepted.
+> **Note:** Requirements and design are in the How?
+> section below.
 
 ## Part 2: Unified State Interface and Storage Backends
 
@@ -354,26 +342,6 @@ distributed storage with richer semantics.
   while the storage layer originally treated relational
   conversation/response CRUD as a consumer-side concern
   (proposal #354).
-
-### Open Questions
-
-- Should storage backend connections survive
-  configuration hot-reloads, or is reconnection on
-  reload acceptable?
-
-### SQL as a storage backend
-
-> **To resolve before graduation.** The two source
-> proposals disagree. The state model (Part 1) and the
-> Unified State Interface list SQLite and PostgreSQL as
-> first-class Storage-state backends. The Storage Layer
-> non-goals (from ENH #412) instead exclude SQL databases
-> as a backend trait, treating relational
-> conversation/response CRUD as a consumer-side concern
-> (proposal #354). Pick one consistent stance: either SQL
-> is a first-class record backend behind the storage
-> trait, or it is a consumer-side concern and the storage
-> trait targets key-value and object stores only.
 
 ### Why?
 
@@ -597,3 +565,269 @@ takes seconds.
 - As a security engineer, I want tenant-scoped
   storage access so that one tenant's data is never
   readable by another tenant.
+
+## How?
+
+### Overview
+
+- Two async backend traits in `praxis-core`: `KvStore`
+  for small hot-path values, `ObjectStore` for large
+  blobs.
+- A `StateRegistry` built from config at startup, owned
+  in `ServerState`, threaded into every pipeline and
+  re-attached across reload; reachable from filters via
+  `HttpFilterContext` and from background tasks by clone.
+- A top-level `state:` config block declaring named
+  backends with explicit scope (filter, chain, global).
+- Every backend honors the contract: tenant isolation,
+  per-entry TTL, per-entry and per-tenant size limits, a
+  timeout on every operation, and a per-consumer
+  `failure_mode: open | closed`.
+- Zero-dependency defaults so Praxis runs with no
+  external service: an in-memory key-value store (with
+  TTL, tenancy, and quota) and in-memory and filesystem
+  object stores.
+- No built-in filter fails when storage is absent unless
+  it declares the dependency.
+- SQL, Valkey/Redis, and S3/GCS/Rados backends live
+  behind opt-in cargo features; external crates can add
+  backends without changing core.
+- The AI Responses/Conversations stores move onto the
+  registry with no data migration.
+
+### Design
+
+#### Traits
+
+Both traits are `async` and `Send + Sync`. Every call
+takes a `Scope`, so a filter cannot reach another
+tenant's data by accident.
+
+```rust
+#[async_trait]
+pub trait KvStore: Send + Sync + Debug {
+    async fn get(&self, scope: &Scope, key: &str)
+        -> Result<Option<Bytes>, StateError>;
+    async fn set(&self, scope: &Scope, key: &str,
+        val: Bytes, ttl: Option<Duration>)
+        -> Result<(), StateError>;
+    async fn delete(&self, scope: &Scope, key: &str)
+        -> Result<bool, StateError>;
+    /// Conditional write on an opaque version token,
+    /// not on serialized value bytes.
+    async fn compare_and_set(&self, scope: &Scope,
+        key: &str, expected: Option<&Version>,
+        val: Bytes, ttl: Option<Duration>)
+        -> Result<Version, StateError>;
+    async fn incr_by(&self, scope: &Scope, key: &str,
+        delta: i64, ttl: Option<Duration>)
+        -> Result<i64, StateError>;
+}
+
+#[async_trait]
+pub trait ObjectStore: Send + Sync + Debug {
+    async fn put(&self, scope: &Scope, key: &str,
+        body: ObjectBody, meta: ObjectMeta)
+        -> Result<(), StateError>;
+    async fn get(&self, scope: &Scope, key: &str)
+        -> Result<Option<ObjectRead>, StateError>;
+    async fn delete(&self, scope: &Scope, key: &str)
+        -> Result<bool, StateError>;
+    async fn list(&self, scope: &Scope, prefix: &str,
+        cursor: Option<&str>, limit: u32)
+        -> Result<ObjectPage, StateError>;
+}
+```
+
+`StateError` is a typed enum (`NotFound`,
+`PreconditionFailed`, `TooLarge`, `Timeout`,
+`Unavailable`, `Backend`), so a caller can tell a
+precondition or quota failure apart from a generic one.
+Object bodies stream instead of buffering whole blobs,
+since attachments run up to 32 MiB.
+
+The existing `KvBackend` cache is left alone; these are
+new, durable, tenant-aware traits. They are the backend
+layer: the typed domain APIs from Part 1 (rate limits,
+token ledgers, sessions) are the usual filter-facing
+surface and build on top of them.
+
+#### Registry and lifecycle
+
+`StateRegistry` follows `KvStoreRegistry`: a cheap `Arc`
+clone over one shared map, so the same handle survives
+`ArcSwap` pipeline swaps.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct StateRegistry { /* Arc<inner> */ }
+
+impl StateRegistry {
+    pub fn kv(&self, name: &str)
+        -> Option<Arc<dyn KvStore>>;
+    pub fn object(&self, name: &str)
+        -> Option<Arc<dyn ObjectStore>>;
+}
+```
+
+The difference is where backends come from.
+`KvStoreRegistry::get_or_create` hardcodes the in-memory
+backend; `StateRegistry` builds its backends from
+`config.state` at startup. From there the wiring matches
+the registries we already have: owned in `ServerState`,
+passed through `resolve_pipelines` and
+`configure_pipeline` onto a `FilterPipeline` field (and
+into branch and IRR sub-pipelines), exposed on
+`HttpFilterContext`, and carried through `WatcherParams`
+into `reload_pipelines`. Background jobs like a TTL sweep
+or reconnect get their own clone on a dedicated runtime,
+the same as health checks. Filters look up a backend by
+name at request time; they never build one. Domain
+backends core does not name, like the SQL conversation
+store, register and fetch their own trait object by name,
+the way the AI repo's registry already does.
+
+#### Configuration
+
+```yaml
+state:
+  backends:
+    - name: hot
+      kind: memory          # memory | valkey
+      ttl_default: 30s
+      max_entry_bytes: 65_536         # 64 KiB
+      max_tenant_bytes: 16_777_216    # 16 MiB
+    - name: blobs
+      kind: filesystem      # memory | filesystem | s3 | gcs | rados
+      path: /var/lib/praxis/objects
+      max_object_bytes: 33_554_432    # 32 MiB
+    - name: convo
+      kind: sqlite          # sqlite | postgres (feature: sql)
+      database_url: ${DATABASE_URL}
+```
+
+Backends are filter-scoped by default; chain or global
+scope is opt-in. A filter names the backend it wants
+(`store: convo`) and gets a typed handle. The schema
+follows the usual conventions: `snake_case` enums,
+`deny_unknown_fields`, `try_from` newtypes for bounded
+numbers, and `${ENV}` for secrets.
+
+#### Contract enforcement
+
+TTL, size limits, timeouts, and metrics live in the
+registry wrapper, so every backend gets them and none can
+skip them. Metrics record latency and outcome per
+operation, and never use tenant, key, or prompt as a
+label, which would wreck cardinality. Encryption at rest
+is a hook with a null default; proxy-managed envelope
+encryption comes later, since it has to work with the
+version-token compare-and-set and needs key management.
+
+#### Default backends
+
+- **In-memory key-value:** a new type (not the
+  contract-less `InMemoryKvBackend`) with TTL, tenant
+  scoping, and per-tenant quota. This is the zero-config
+  default.
+- **In-memory and filesystem object stores:** no driver,
+  no server. The filesystem store uses tenant-prefixed
+  paths, atomic write-then-rename, and a background TTL
+  sweep.
+- **SQLite and PostgreSQL** (feature `sql`): the existing
+  `SqliteResponseStore` and `PostgresResponseStore`,
+  reused as they are. The local default points at a file,
+  never in-memory SQLite (one connection, gone on reload).
+
+`sqlx` stays behind the feature, out of a default core
+build.
+
+#### Adapting the AI repo
+
+None of this is a rewrite:
+
+1. Keep `ResponseStore` and `ConversationItemStore` as
+   domain traits; their transaction and pagination
+   behavior is unchanged.
+2. Register the store into the core `StateRegistry` at
+   startup, instead of the current per-request, empty,
+   single-`"default"`-key registry. That one change fixes
+   reload survival, probe and admin access, the
+   one-store-per-instance limit, and the ordering
+   dependency between the store and rehydrate filters.
+3. Move the generic pieces (pool config, SSL and SSRF
+   validation, table-identifier checks, schema
+   versioning) into the shared crate, and collapse the
+   two duplicated config structs and `StorageBackend`
+   enums into one.
+4. Swap the serialized-JSON compare-and-swap for the
+   version-token form.
+5. Keep the existing DDL, table names, and schema version
+   so no deployment needs a migration.
+
+The reference schema for responses and conversations
+(criterion 6) lives with the domain store, not behind the
+generic trait.
+
+#### Ephemeral and storage are separate
+
+They differ in durability and concurrency, not size.
+Ephemeral state is a hot-path cache that can be lost on
+restart; storage state is durable, off the hot path, and
+usually network-backed. One trait cannot do both well:
+the hot path needs cheap access, while a durable backend
+needs `async` I/O with a timeout on every call. Fold them
+together and blocking I/O ends up on the request path,
+which Part 1 rules out.
+
+#### SQL is a registered backend, not a core trait
+
+Core owns the registry, the lifecycle, and the two
+generic traits (key-value and object store). Relational
+access for responses and conversations stays a domain
+trait (`ResponseStore`, `ConversationItemStore`) that
+registers into the same registry behind an opt-in
+feature, so praxis-core never pulls in a SQL driver. That
+is what lets the compare-and-swap, transactional writes,
+and keyset pagination those APIs depend on keep working,
+instead of bending a generic trait until it becomes a
+database.
+
+#### Backends and their state survive reload
+
+The registry is built once and re-attached to each
+rebuilt pipeline, the way `KvStoreRegistry` and
+`HealthRegistry` already work. A backend reconnects only
+when its own config changes, and a teardown is logged.
+
+### Implementation
+
+The work splits into steps that can each land on their
+own:
+
+1. Core traits, `StateRegistry`, the `state:` config, and
+   the zero-dependency defaults, wired through the
+   pipeline and reload.
+2. Background TTL sweep and eviction, plus the reload
+   warning on stateful teardown.
+3. The `sql` feature and the AI move above.
+4. Distributed backends (Valkey, S3/GCS/Rados) for
+   multi-replica correctness.
+5. Follow-ups: encryption at rest and retention policies.
+
+Every praxis change carries unit and integration tests,
+an example under `examples/configs/state/`, and a
+functional test for it.
+
+# Notes
+
+> **Merge note:** This proposal merges the former ENH #99
+> (Stateful Proxy State Management) and ENH #412 (Storage
+> Layer). #412 tracked the pluggable backend traits beneath
+> #99's state model and was on hold; its content is folded
+> in here and it is superseded by this proposal. Part 1 is
+> the state model and typed domain APIs (from #99). Part 2
+> is the unified state interface and the storage backend
+> traits (from #99's interface section and #412). The one
+> point where the two proposals disagreed, whether SQL is a
+> first-class backend, is settled in the How? section.
