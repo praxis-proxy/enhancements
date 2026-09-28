@@ -18,6 +18,7 @@ graduation_criteria:
   - SQL as a core variant with a SQLite file default agreed by stakeholders
   - Every variant has a local default implementation that runs with no external service
   - KvBackend deprecation path agreed by stakeholders
+  - Backend connectivity fields aligned with the shared service definition once it lands
   - Reference schema for conversation/response storage
 experimental_exempt: true
 experimental_exempt_reason: "Core infrastructure and configuration schema change"
@@ -636,8 +637,9 @@ takes seconds.
   filters via `HttpFilterContext` and from background
   tasks by clone.
 - A top-level `state:` config block declaring named
-  backends, each with a kind, an access scope
-  (filter, chain, global), a timeout, and limits.
+  backends grouped by variant (`kv`, `sql`, `object`),
+  each with a kind, an access scope (filter, chain,
+  global), a timeout, and limits.
 - Every backend honors the contract: tenant isolation,
   per-entry TTL, per-entry and per-tenant size limits,
   a timeout on every operation, and a per-consumer
@@ -766,7 +768,7 @@ pub trait KvStore: Send + Sync + Debug {
     /// Conditional write on an opaque version token,
     /// not on serialized value bytes.
     async fn compare_and_set(&self, scope: &Scope,
-        key: &str, expected: Option<&Version>,
+        key: &str, expected: Option<Version>,
         val: Bytes, ttl: Option<Duration>)
         -> Result<Version, StateError>;
     async fn incr_by(&self, scope: &Scope, key: &str,
@@ -796,6 +798,8 @@ pub trait ObjectStore: Send + Sync + Debug {
         -> Result<(), StateError>;
     async fn get(&self, scope: &Scope, key: &str)
         -> Result<Option<ObjectRead>, StateError>;
+    async fn head(&self, scope: &Scope, key: &str)
+        -> Result<Option<ObjectInfo>, StateError>;
     async fn delete(&self, scope: &Scope, key: &str)
         -> Result<bool, StateError>;
     async fn list(&self, scope: &Scope, prefix: &str,
@@ -804,12 +808,16 @@ pub trait ObjectStore: Send + Sync + Debug {
 }
 ```
 
-`StateError` is a typed enum (`NotFound`,
-`PreconditionFailed`, `TooLarge`, `Timeout`,
-`Unavailable`, `Backend`), so a caller can tell a
-precondition or quota failure apart from a generic one.
-Object bodies stream instead of buffering whole blobs,
-since attachments run up to 32 MiB.
+`StateError` is a typed enum (`PreconditionFailed`,
+`InvalidValue`, `TooLarge`, `Timeout`, `Unavailable`,
+`Backend`), so a caller can tell a precondition or
+quota failure apart from a generic one. A miss is
+`Ok(None)` on every `get` and `head`, never an error:
+there is no `NotFound` variant, so backends cannot
+disagree about which to return, and callers that
+expect misses (a TTL expiry is a miss) handle one code
+path. Object bodies stream instead of buffering whole
+blobs, since attachments run up to 32 MiB.
 
 `SqlConnection` wraps the pooled connection for the
 dialect (an `sqlx` connection today; nothing in the
@@ -821,6 +829,48 @@ traits (`ResponseStore`, `ConversationItemStore`)
 take a `SqlStore` handle and install their schema
 through `ensure_schema`, instead of registering beside
 the generic traits.
+
+**Conditional writes.** `compare_and_set` with
+`expected: None` succeeds only when the key is absent
+(create-if-absent); with `Some(v)` it succeeds only
+when the key's current version equals `v`. Success
+returns the new `Version`. Failure returns
+`StateError::PreconditionFailed { current }`, carrying
+the key's current version (or `None` if it no longer
+exists) so the caller can re-read and retry without a
+second round trip. `Version` is `Copy`, backend
+assigned, monotonic per key, and never derived from
+the value bytes, so two writers storing equal bytes
+still get distinct versions. A plain `set` bumps the
+version too. A load-link/store-conditional form, where
+only in-flight pairs carry a version, is a possible
+follow-up if per-entry versions prove too heavy; the
+signature above does not preclude it.
+
+**Counters.** `incr_by` treats the value as a decimal
+ASCII integer, the encoding Valkey's `INCRBY` requires,
+so a `get` after `incr_by` returns readable bytes and a
+`set` of `b"41"` followed by `incr_by(1)` yields `42`.
+An absent key counts as `0`. `delta` may be negative; a
+value that is not a decimal integer, or a result
+outside `i64`, fails with `StateError::InvalidValue`.
+For `incr_by` and `set` alike, `ttl: Some(d)` sets or
+refreshes the key's expiry, while `ttl: None` leaves an
+existing expiry alone and gives a new key the backend's
+`ttl_default`. Values are bytes at this boundary on
+purpose: the typed domain layer chooses encodings, and
+a typed value layer can sit on top without changing
+the trait.
+
+**Objects.** `head` returns metadata without the body,
+for size checks and conditional fetches. Multipart
+upload is an implementation detail of `put` on
+S3-class backends: `ObjectBody` streams, so a backend
+chunks as it likes and the trait never exposes parts.
+Object tagging and attribute queries beyond
+`ObjectInfo` are follow-ups; the S3 and Swift object
+APIs both map onto `ObjectMeta` and `ObjectInfo` once a
+consumer needs them.
 
 #### Registry and lifecycle
 
@@ -864,7 +914,7 @@ request time; they never build one.
 
 ```yaml
 state:
-  backends:
+  kv:
     - name: hot
       kind: memory          # memory | valkey
       scope: filter         # filter | chain | global
@@ -877,10 +927,12 @@ state:
       url: ${VALKEY_URL}
       scope: global
       timeout: 100ms
+  sql:
     - name: convo
       kind: sqlite          # sqlite | postgres
       path: /var/lib/praxis/state/convo.db
       timeout: 2s
+  object:
     - name: blobs
       kind: filesystem      # memory | filesystem | s3 | gcs | rados
       scope: chain
@@ -888,6 +940,21 @@ state:
       timeout: 5s
       max_object_bytes: 33_554_432    # 32 MiB
 ```
+
+Backends are grouped by variant, so the family is the
+config key and `kind` is an enum per family: `memory`
+and `valkey` under `kv` register a `KvStore`, `sqlite`
+and `postgres` under `sql` register a `SqlStore`, and
+`memory`, `filesystem`, `s3`, `gcs`, and `rados` under
+`object` register an `ObjectStore`. A `sql` entry is a
+relational backend with transactions and pagination
+that the generic traits do not expose; it never
+masquerades as a key-value or object store, and the
+domain traits that need SQL (`ResponseStore`,
+`ConversationItemStore`) build on it. Names are unique
+across families, so `store: convo` resolves without
+ambiguity and `StateRegistry::sql("convo")` is the only
+accessor that returns it.
 
 A consumer names the backend it wants and sets its own
 failure mode:
@@ -902,9 +969,9 @@ filters:
 
 Backends are filter-scoped by default; chain or global
 scope is opt-in per backend. A filter names the backend
-it wants (`store: convo`) and gets a typed handle; the
-registry rejects a name whose kind does not match the
-handle type at startup. `failure_mode` is set where the
+it wants (`store: convo`) and gets a typed handle; a
+consumer that asks for a `kv` handle by a `sql` name
+fails at startup. `failure_mode` is set where the
 backend is consumed, since the same backend can be
 advisory for one filter and enforcement for another.
 `timeout` bounds every operation, and a backend that
@@ -913,6 +980,15 @@ local defaults take a `path`; only external backends
 take a `url`. The schema follows the usual conventions:
 `snake_case` enums, `deny_unknown_fields`, `try_from`
 newtypes for bounded numbers, and `${ENV}` for secrets.
+
+Connectivity fields on external backends (`url`, TLS,
+auth) are a placeholder for the shared service
+definition being drafted separately. When it lands, a
+backend references a service by name instead of
+carrying its own connection fields, so state backends
+and upstream clusters share one definition of TLS and
+auth. This proposal does not define that service model
+and does not block on it.
 
 #### Contract enforcement
 
@@ -953,6 +1029,19 @@ management.
   write-then-rename, and a background TTL sweep. An
   in-memory object store exists for tests.
 
+`ObjectStore` is a contract, not a storage technology:
+any backend that offers put, get, head, delete, and
+list-by-prefix over opaque blobs qualifies, whether it
+is a POSIX filesystem, an in-memory map, an
+S3-compatible service, or an embedded store such as
+RocksDB. The filesystem backend is the local default
+because it needs nothing installed, not because it is a
+demo. It lists by walking the directory under the
+tenant prefix and has no multipart or tagging, which the
+contract does not require. The `list` cursor is opaque
+per backend (a continuation token on S3, the last path
+on the filesystem).
+
 `sqlx` stays behind the `sql` feature, out of a default
 `praxis-core` library build. The `praxis` server binary
 turns the feature on so the SQLite default works out of
@@ -986,7 +1075,7 @@ None of this is a rewrite:
 5. Keep the existing DDL, table names, and schema
    version so no deployment needs a data migration.
    Operators do move `backend:` and `database_url:`
-   from each filter into one `state.backends` entry and
+   from each filter into one `state.sql` entry and
    reference it by name; the release notes carry that
    mapping.
 
@@ -1110,8 +1199,9 @@ own:
 5. Distributed backends (Valkey, S3/GCS/Rados) for
    multi-replica correctness, and the token rate
    limit's Valkey ledger borrowing the shared pool.
-6. Follow-ups: encryption at rest and retention
-   policies.
+6. Follow-ups: encryption at rest, retention policies,
+   object tagging, and a load-link/store-conditional
+   form of conditional writes.
 
 Every praxis change carries unit and integration tests,
 an example under `examples/configs/state/`, and a
