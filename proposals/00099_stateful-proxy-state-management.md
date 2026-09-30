@@ -5,22 +5,28 @@ status: proposed
 repos:
   - praxis
   - ai
+  - extproc
+  - policy
 authors:
   - nerdalert
   - shaneutt
   - rikatz
 graduation_criteria:
   - State class taxonomy agreed by stakeholders
-  - State type hierarchy agreed by stakeholders
-  - Scoping model agreed
-  - Determine whether Ephemeral and Persistent storage really need to be separate and resolve
-  - Storage trait API design reviewed by stakeholders
+  - Scoping model (tenant plus consumer namespace; filter, chain, or global access) agreed by stakeholders
+  - Storage trait API design (KvStore, SqlStore, ObjectStore) reviewed by stakeholders
+  - SQL as a core variant with a SQLite file default agreed by stakeholders
+  - Every variant has a local default implementation that runs with no external service
+  - KvBackend deprecation path agreed by stakeholders
+  - Backend connectivity fields aligned with the shared service definition once it lands
   - Reference schema for conversation/response storage
-  - Resolve whether SQL is a first-class storage backend or a consumer-side concern
-  - How? section with requirements and design
+experimental_exempt: true
+experimental_exempt_reason: "Core infrastructure and configuration schema change"
 supersedes: 00412
 related:
   - 00354
+  - 00108
+  - 00121
 stakeholders:
   - shaneutt
   - nerdalert
@@ -38,17 +44,6 @@ merged_from:
 ---
 
 # Stateful Proxy State Management and Storage Layer
-
-> **Merge note:** This proposal merges the former ENH #99
-> (Stateful Proxy State Management) and ENH #412 (Storage
-> Layer). #412 tracked the pluggable backend traits beneath
-> #99's state model and was on hold; its content is folded
-> in here and it is superseded by this proposal. Part 1 is
-> the state model and typed domain APIs (from #99). Part 2
-> is the unified state interface and the storage backend
-> traits (from #99's interface section and #412). One point
-> where the two source proposals disagreed is flagged inline
-> under "SQL as a storage backend".
 
 ## Part 1: State Model
 
@@ -77,13 +72,16 @@ Praxis replicas.
 This proposal establishes the direction that stateful
 features must use explicit storage classes and typed
 domain APIs instead of exposing a raw global key-value API
-as the primary filter-facing abstraction. Local in-memory
-implementations should be available for tests, development,
-demos, explicitly single-replica deployments, and some niche
-HA scenarios. The default production guidance will be that
-implementations must use an external (e.g. Valkey) storage
-backend first, with strict timeouts, TTLs, key conventions,
-failure-mode defaults, and bounded metrics labels.
+as the primary filter-facing abstraction. Every storage
+variant ships a default implementation that runs entirely
+locally, so Praxis starts and serves with no external
+service; that default covers tests, development, demos,
+explicitly single-replica deployments, and some niche HA
+scenarios. The production guidance for multi-replica
+deployments is to replace the local default with an
+external backend (e.g. Valkey), with strict timeouts, TTLs,
+key conventions, failure-mode defaults, and bounded metrics
+labels.
 
 ### Goals
 
@@ -230,9 +228,8 @@ certificate management, or desired configuration state.
   and support graceful degradation with recovery rather
   than silent latency creep or hard failures.
 
-> **Note:** Detailed requirements and design should be
-> added in a follow-up proposal update after the state
-> model and motivation are accepted.
+> **Note:** Requirements and design are in the How?
+> section below.
 
 ## Part 2: Unified State Interface and Storage Backends
 
@@ -253,12 +250,14 @@ abstraction. It has two categories:
 - **Ephemeral state** covers backends like Valkey
   and in-memory stores. Data may be lost on restart.
   Suitable for caches, counters, and session
-  affinity across requests and replicas.
+  affinity across requests and replicas. Served by
+  the key-value trait.
 
 - **Storage state** covers persistent backends like
   PostgreSQL, SQLite, and file stores. Data survives
   restarts. Suitable for conversation history,
   response records, and durable business data.
+  Served by the SQL and object store traits.
 
 Filters and other consumers (such as probes)
 declare their state needs in configuration. Praxis
@@ -268,21 +267,24 @@ specific filter, a named chain, or made globally
 available with explicit opt-in.
 
 Beneath the typed domain APIs from Part 1, the interface
-defines two pluggable storage backend traits (one for
-key-value lookups and one for object/blob storage) along
-with the contract each backend must satisfy (multi-tenancy,
-TTL, encryption, size limits) and reference implementations
-for common backends. This is internal storage for proxy
-operation, not storage exposed to clients: Praxis does not
-become a storage proxy or gateway to S3/GCS/Rados; it uses
-these systems internally to persist its own operational
-state.
+defines three pluggable storage backend traits, one per
+variant: key-value (ephemeral), relational SQL (durable
+records), and object/blob storage (durable payloads). Each
+comes with the contract every backend must satisfy
+(multi-tenancy, TTL, size limits, timeouts, failure
+semantics), a default implementation that runs entirely
+locally, and optional external backends. This is internal
+storage for proxy operation, not storage exposed to
+clients: Praxis does not become a storage proxy or gateway
+to S3/GCS/Rados; it uses these systems internally to
+persist its own operational state.
 
-The existing `KvBackend` trait in `praxis-core` is
-a runtime cache (in-memory, non-durable, no TTL, no
-tenancy). It remains unchanged. The traits introduced
-here are separate abstractions for durable,
-distributed storage with richer semantics.
+The existing `KvBackend` trait in `praxis-core` is a
+runtime cache (in-memory, non-durable, no TTL, no
+tenancy). The key-value trait introduced here supersedes
+it: the admin key-value endpoints move onto the new
+registry over a deprecation window, so core ends up with
+one key-value abstraction rather than two.
 
 ### Goals
 
@@ -294,37 +296,46 @@ distributed storage with richer semantics.
 - Scoped access by default: backends are bound to
   a filter or chain. Global access requires
   explicit configuration.
-- Pluggable backends: core defines traits and ships
-  common defaults (in-memory, Valkey, SQLite,
-  OpenAI Files API). External crates provide
-  additional backends (e.g. PostgreSQL) without
-  modifying core.
+- Pluggable backends: core defines the traits and
+  ships a local default for each variant (in-memory
+  key-value, SQLite file, local filesystem). Valkey,
+  PostgreSQL, and S3-compatible backends are opt-in
+  cargo features. External crates provide additional
+  backends without modifying core.
 - Accessible to filters and to probes (background
   processes), decoupled from the HTTP request
   lifecycle.
-- Define two storage backend traits accessible to
+- Define three storage backend traits accessible to
   filters via `HttpFilterContext`:
   - **Key-value trait**: small values, low latency,
-    keyed lookups. Backends: in-memory (demo/test),
-    Valkey/Redis (production).
+    keyed lookups. Backends: in-memory (default),
+    Valkey/Redis (multi-replica).
+  - **SQL trait**: relational records with
+    transactions and keyset pagination. Backends:
+    SQLite file (default), PostgreSQL (multi-replica).
   - **Object store trait**: large payloads, higher
-    latency, blob storage. Backends: S3, GCS, Rados,
-    local filesystem (demo/test).
+    latency, blob storage. Backends: local filesystem
+    (default), in-memory (tests), S3-compatible
+    including MinIO, GCS, Rados (multi-replica).
 - Define the contract that all backend implementations
   must satisfy:
   - Multi-tenancy: tenant-scoped access, one tenant
     cannot read another tenant's data.
   - TTL: per-entry expiration with configurable
     defaults.
-  - Encryption: data encrypted at rest (backend-native
-    or proxy-managed).
+  - Encryption: an at-rest encryption hook on every
+    backend, backend-native where the backend offers
+    it; proxy-managed envelope encryption is a
+    follow-up.
   - Size limits: per-entry and per-tenant quotas.
   - Failure semantics: configurable fail-open or
     fail-closed per filter, with timeouts on every
     storage operation.
 - Provide reference implementations:
-  - In-memory (key-value and object): for development,
-    testing, demos, and single-replica deployments.
+  - A local default per trait that needs no external
+    service: in-memory key-value, SQLite file, local
+    filesystem. These are real defaults for
+    single-replica deployments, not demo-only stubs.
   - At least one distributed backend per trait for
     production multi-replica deployments.
 - Define a reference schema for conversation and
@@ -340,40 +351,15 @@ distributed storage with richer semantics.
 
 ### Non-Goals
 
-- Replacing the existing `KvBackend` runtime cache
-  trait.
 - Defining typed domain APIs for specific features
   (rate limiters, token ledgers, session stores).
   Those are defined in Part 1 above.
 - Making Praxis a database. Storage backends are
-  external systems; Praxis provides the integration
-  interface.
-- SQL databases as a backend. See the open question
-  below, which this merge surfaces: the state model
-  above lists SQLite/PostgreSQL as storage backends,
-  while the storage layer originally treated relational
-  conversation/response CRUD as a consumer-side concern
-  (proposal #354).
-
-### Open Questions
-
-- Should storage backend connections survive
-  configuration hot-reloads, or is reconnection on
-  reload acceptable?
-
-### SQL as a storage backend
-
-> **To resolve before graduation.** The two source
-> proposals disagree. The state model (Part 1) and the
-> Unified State Interface list SQLite and PostgreSQL as
-> first-class Storage-state backends. The Storage Layer
-> non-goals (from ENH #412) instead exclude SQL databases
-> as a backend trait, treating relational
-> conversation/response CRUD as a consumer-side concern
-> (proposal #354). Pick one consistent stance: either SQL
-> is a first-class record backend behind the storage
-> trait, or it is a consumer-side concern and the storage
-> trait targets key-value and object stores only.
+  external systems or embedded engines; Praxis
+  provides the integration interface.
+- Cache APIs, replicated (CRDT) state, append-only
+  sinks, and service lifecycle. See "Not in this
+  proposal" in the How? section.
 
 ### Why?
 
@@ -511,11 +497,21 @@ The storage trait centralizes these concerns so
 filter authors write against a stable interface and
 operators configure backends once.
 
-#### Why Two Traits
+#### Why Three Traits
 
 **Key-value**: session flags, routing decisions,
 counters, tenant metadata. Bytes to low KB, sub-
-millisecond access, on the request hot path.
+millisecond access, on the request hot path. May be
+lost on restart.
+
+**SQL**: response records, conversation items,
+pending approvals, catalogs. Rows with indexes,
+transactions, and keyset pagination, read and written
+once per request off the hot path. Must survive
+restarts. The Responses and Conversations stores
+already depend on transactional writes and
+compare-and-swap that neither a key-value nor a blob
+interface can express.
 
 **Object store**: serialized conversation history,
 response objects, cached inference responses, file
@@ -524,10 +520,12 @@ KB to multi-MB per entry, accessed once per request
 (rehydration) or once per response (persistence).
 
 A KV interface lacks streaming and multipart
-semantics for multi-MB blobs. An object store
-interface adds unnecessary overhead for a 64-byte
-counter. Different access patterns warrant different
-abstractions.
+semantics for multi-MB blobs and cannot express a
+transaction across rows. An object store interface
+adds unnecessary overhead for a 64-byte counter. A
+relational interface is the wrong shape for either.
+Different access patterns warrant different
+abstractions, and each one gets a local default.
 
 #### Why Object Stores
 
@@ -597,3 +595,628 @@ takes seconds.
 - As a security engineer, I want tenant-scoped
   storage access so that one tenant's data is never
   readable by another tenant.
+
+## How?
+
+### Requirements
+
+- Three backend traits in `praxis-core`, one per
+  variant: `KvStore` (ephemeral), `SqlStore` (durable
+  records), `ObjectStore` (durable payloads).
+- Every variant has a default implementation that
+  runs entirely locally with no external service, and
+  at least one external backend for multi-replica
+  deployments.
+- One registry, built from config at startup, that
+  survives pipeline reload and is reachable from
+  filters, probes, and background tasks.
+- Every backend honors one contract: tenant isolation,
+  per-entry TTL where the variant supports it, size
+  limits, a timeout on every operation, and a
+  per-consumer failure mode.
+- A backend declares its capabilities (shared across
+  replicas, atomic operations, durable) so a consumer
+  can refuse a configuration that cannot enforce what
+  it promises.
+- No built-in filter fails when storage is absent
+  unless it declares the dependency.
+- The default `praxis-core` library build carries no
+  database or object-storage driver; external backends
+  and `sqlx` sit behind cargo features.
+- Existing AI stores move onto the registry with no
+  data migration.
+
+### Overview
+
+- Three async backend traits in `praxis-core`:
+  `KvStore` for small hot-path values, `SqlStore` for
+  relational records, `ObjectStore` for large blobs.
+- A `StateRegistry` built from config at startup,
+  owned in `ServerState`, threaded into every pipeline
+  and re-attached across reload; reachable from
+  filters via `HttpFilterContext` and from background
+  tasks by clone.
+- A top-level `state:` config block declaring named
+  backends grouped by variant (`kv`, `sql`, `object`),
+  each with a kind, an access scope (filter, chain,
+  global), a timeout, and limits.
+- Every backend honors the contract: tenant isolation,
+  per-entry TTL, per-entry and per-tenant size limits,
+  a timeout on every operation, and a per-consumer
+  `failure_mode: open | closed`.
+- Local defaults so Praxis runs with no external
+  service: an in-memory key-value store (with TTL,
+  tenancy, and quota), a SQLite file store, and a
+  local filesystem object store, plus an in-memory
+  object store for tests.
+- Valkey/Redis, PostgreSQL, and S3-compatible
+  (including MinIO), GCS, and Rados backends live
+  behind opt-in cargo features; external crates can
+  add backends without changing core.
+- `KvStore` supersedes the existing `KvBackend`
+  runtime cache over a deprecation window.
+- The AI Responses/Conversations stores move onto the
+  registry with no data migration.
+
+### Design
+
+#### Types
+
+```rust
+/// Who owns the data and which consumer wrote it.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Scope {
+    /// Trusted tenant identity. Never derived from an
+    /// unauthenticated request header.
+    pub tenant: Arc<str>,
+    /// Consumer namespace: the filter instance name for
+    /// filter-scoped backends, the chain name for
+    /// chain-scoped ones, or `global`.
+    pub namespace: Arc<str>,
+}
+
+/// Opaque, backend-assigned version of one key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Version(u64);
+
+/// What a backend can promise.
+#[derive(Clone, Copy, Debug)]
+pub struct Capabilities {
+    /// Writes are visible to every replica.
+    pub shared: bool,
+    /// `compare_and_set` and `incr_by` are atomic.
+    pub atomic: bool,
+    /// Data survives a process restart.
+    pub durable: bool,
+}
+
+pub enum SqlDialect { Sqlite, Postgres }
+
+/// A named, versioned set of DDL statements a domain
+/// store installs once per backend.
+pub struct SchemaSpec<'a> {
+    pub name: &'a str,
+    pub version: i64,
+    pub ddl: &'a [&'a str],
+}
+
+/// Streaming body; never a whole blob in memory.
+pub struct ObjectBody(Pin<Box<dyn AsyncRead + Send>>);
+
+pub struct ObjectMeta {
+    pub content_type: Option<String>,
+    pub size_hint: Option<u64>,
+    pub ttl: Option<Duration>,
+}
+
+pub struct ObjectInfo {
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub etag: Option<String>,
+    pub modified: SystemTime,
+}
+
+pub struct ObjectRead {
+    pub info: ObjectInfo,
+    pub body: ObjectBody,
+}
+
+pub struct ObjectPage {
+    pub entries: Vec<(String, ObjectInfo)>,
+    pub next: Option<String>,
+}
+```
+
+`Scope` carries two things the traits need on every
+call: the tenant, so one tenant can never read
+another's data by accident, and the consumer
+namespace, which is how "filter-scoped by default"
+works. Two filters that name the same backend get
+disjoint namespaces unless the backend is declared
+chain- or global-scoped. The namespace is the
+configured filter or chain name, which is stable
+across reloads, so a rebuilt filter finds its own
+data again. The AI repo's `StateOwner` maps its
+`tenant_id` onto `Scope::tenant` and keeps issuer and
+subject in its own schema.
+
+`Capabilities` is how a consumer refuses an unsafe
+configuration. A token quota configured to enforce a
+fleet-wide budget checks `shared` at startup and
+fails closed on a memory backend instead of silently
+enforcing per replica. A consumer that needs
+durability checks `durable` the same way.
+
+#### Traits
+
+All three traits are `async` and `Send + Sync`. Every
+`KvStore` and `ObjectStore` call takes a `Scope`.
+`SqlStore` hands out a connection; its rows are
+tenant-scoped by the domain schema that owns them.
+
+```rust
+#[async_trait]
+pub trait KvStore: Send + Sync + Debug {
+    fn capabilities(&self) -> Capabilities;
+    async fn get(&self, scope: &Scope, key: &str)
+        -> Result<Option<Bytes>, StateError>;
+    async fn set(&self, scope: &Scope, key: &str,
+        val: Bytes, ttl: Option<Duration>)
+        -> Result<(), StateError>;
+    async fn delete(&self, scope: &Scope, key: &str)
+        -> Result<bool, StateError>;
+    /// Conditional write on an opaque version token,
+    /// not on serialized value bytes.
+    async fn compare_and_set(&self, scope: &Scope,
+        key: &str, expected: Option<Version>,
+        val: Bytes, ttl: Option<Duration>)
+        -> Result<Version, StateError>;
+    async fn incr_by(&self, scope: &Scope, key: &str,
+        delta: i64, ttl: Option<Duration>)
+        -> Result<i64, StateError>;
+}
+
+#[async_trait]
+pub trait SqlStore: Send + Sync + Debug {
+    fn capabilities(&self) -> Capabilities;
+    fn dialect(&self) -> SqlDialect;
+    /// Pooled connection, bounded by the backend
+    /// timeout.
+    async fn acquire(&self)
+        -> Result<SqlConnection, StateError>;
+    /// Install a domain schema once, keyed by name
+    /// and version.
+    async fn ensure_schema(&self, schema: &SchemaSpec<'_>)
+        -> Result<(), StateError>;
+}
+
+#[async_trait]
+pub trait ObjectStore: Send + Sync + Debug {
+    fn capabilities(&self) -> Capabilities;
+    async fn put(&self, scope: &Scope, key: &str,
+        body: ObjectBody, meta: ObjectMeta)
+        -> Result<(), StateError>;
+    async fn get(&self, scope: &Scope, key: &str)
+        -> Result<Option<ObjectRead>, StateError>;
+    async fn head(&self, scope: &Scope, key: &str)
+        -> Result<Option<ObjectInfo>, StateError>;
+    async fn delete(&self, scope: &Scope, key: &str)
+        -> Result<bool, StateError>;
+    async fn list(&self, scope: &Scope, prefix: &str,
+        cursor: Option<&str>, limit: u32)
+        -> Result<ObjectPage, StateError>;
+}
+```
+
+`StateError` is a typed enum (`PreconditionFailed`,
+`InvalidValue`, `TooLarge`, `Timeout`, `Unavailable`,
+`Backend`), so a caller can tell a precondition or
+quota failure apart from a generic one. A miss is
+`Ok(None)` on every `get` and `head`, never an error:
+there is no `NotFound` variant, so backends cannot
+disagree about which to return, and callers that
+expect misses (a TTL expiry is a miss) handle one code
+path. Object bodies stream instead of buffering whole
+blobs, since attachments run up to 32 MiB.
+
+`SqlConnection` wraps the pooled connection for the
+dialect (an `sqlx` connection today; nothing in the
+trait assumes `sqlx`). The traits are the backend
+layer. The typed domain APIs from Part 1 (rate limits,
+token ledgers, sessions) are the usual filter-facing
+surface and build on top of them. Relational domain
+traits (`ResponseStore`, `ConversationItemStore`)
+take a `SqlStore` handle and install their schema
+through `ensure_schema`, instead of registering beside
+the generic traits.
+
+**Conditional writes.** `compare_and_set` with
+`expected: None` succeeds only when the key is absent
+(create-if-absent); with `Some(v)` it succeeds only
+when the key's current version equals `v`. Success
+returns the new `Version`. Failure returns
+`StateError::PreconditionFailed { current }`, carrying
+the key's current version (or `None` if it no longer
+exists) so the caller can re-read and retry without a
+second round trip. `Version` is `Copy`, backend
+assigned, monotonic per key, and never derived from
+the value bytes, so two writers storing equal bytes
+still get distinct versions. A plain `set` bumps the
+version too. A load-link/store-conditional form, where
+only in-flight pairs carry a version, is a possible
+follow-up if per-entry versions prove too heavy; the
+signature above does not preclude it.
+
+**Counters.** `incr_by` treats the value as a decimal
+ASCII integer, the encoding Valkey's `INCRBY` requires,
+so a `get` after `incr_by` returns readable bytes and a
+`set` of `b"41"` followed by `incr_by(1)` yields `42`.
+An absent key counts as `0`. `delta` may be negative; a
+value that is not a decimal integer, or a result
+outside `i64`, fails with `StateError::InvalidValue`.
+For `incr_by` and `set` alike, `ttl: Some(d)` sets or
+refreshes the key's expiry, while `ttl: None` leaves an
+existing expiry alone and gives a new key the backend's
+`ttl_default`. Values are bytes at this boundary on
+purpose: the typed domain layer chooses encodings, and
+a typed value layer can sit on top without changing
+the trait.
+
+**Objects.** `head` returns metadata without the body,
+for size checks and conditional fetches. Multipart
+upload is an implementation detail of `put` on
+S3-class backends: `ObjectBody` streams, so a backend
+chunks as it likes and the trait never exposes parts.
+Object tagging and attribute queries beyond
+`ObjectInfo` are follow-ups; the S3 and Swift object
+APIs both map onto `ObjectMeta` and `ObjectInfo` once a
+consumer needs them.
+
+#### Registry and lifecycle
+
+`StateRegistry` follows `KvStoreRegistry`: a cheap `Arc`
+clone over one shared map, so the same handle survives
+`ArcSwap` pipeline swaps.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct StateRegistry { /* Arc<inner> */ }
+
+impl StateRegistry {
+    pub fn kv(&self, name: &str)
+        -> Option<Arc<dyn KvStore>>;
+    pub fn sql(&self, name: &str)
+        -> Option<Arc<dyn SqlStore>>;
+    pub fn object(&self, name: &str)
+        -> Option<Arc<dyn ObjectStore>>;
+}
+```
+
+The difference is where backends come from.
+`KvStoreRegistry::get_or_create` hardcodes the in-memory
+backend; `StateRegistry` builds its backends from
+`config.state` at startup. From there the wiring matches
+the registries we already have: owned in `ServerState`
+next to `KvStoreRegistry`, `HealthRegistry`, and the
+sticky-session `SessionStoreRegistry`, passed through
+`resolve_pipelines` and `configure_pipeline` onto a
+`FilterPipeline` field (and into branch and IRR
+sub-pipelines), exposed on `HttpFilterContext`, and
+carried through `WatcherParams` into `reload_pipelines`.
+The ExtProc server builds its `HttpFilterContext` from
+the same pipeline fields and picks the registry up the
+same way. Background jobs like a TTL sweep or reconnect
+get their own clone on a dedicated runtime, the same as
+health checks. Filters look up a backend by name at
+request time; they never build one.
+
+#### Configuration
+
+```yaml
+state:
+  kv:
+    - name: hot
+      kind: memory          # memory | valkey
+      scope: filter         # filter | chain | global
+      timeout: 50ms
+      ttl_default: 30s
+      max_entry_bytes: 65_536         # 64 KiB
+      max_tenant_bytes: 16_777_216    # 16 MiB
+    - name: ledger
+      kind: valkey
+      url: ${VALKEY_URL}
+      scope: global
+      timeout: 100ms
+  sql:
+    - name: convo
+      kind: sqlite          # sqlite | postgres
+      path: /var/lib/praxis/state/convo.db
+      timeout: 2s
+  object:
+    - name: blobs
+      kind: filesystem      # memory | filesystem | s3 | gcs | rados
+      scope: chain
+      path: /var/lib/praxis/objects
+      timeout: 5s
+      max_object_bytes: 33_554_432    # 32 MiB
+```
+
+Backends are grouped by variant, so the family is the
+config key and `kind` is an enum per family: `memory`
+and `valkey` under `kv` register a `KvStore`, `sqlite`
+and `postgres` under `sql` register a `SqlStore`, and
+`memory`, `filesystem`, `s3`, `gcs`, and `rados` under
+`object` register an `ObjectStore`. A `sql` entry is a
+relational backend with transactions and pagination
+that the generic traits do not expose; it never
+masquerades as a key-value or object store, and the
+domain traits that need SQL (`ResponseStore`,
+`ConversationItemStore`) build on it. Names are unique
+across families, so `store: convo` resolves without
+ambiguity and `StateRegistry::sql("convo")` is the only
+accessor that returns it.
+
+A consumer names the backend it wants and sets its own
+failure mode:
+
+```yaml
+filters:
+  - name: openai_response_store
+    config:
+      store: convo
+      failure_mode: closed  # open | closed
+```
+
+Backends are filter-scoped by default; chain or global
+scope is opt-in per backend. A filter names the backend
+it wants (`store: convo`) and gets a typed handle; a
+consumer that asks for a `kv` handle by a `sql` name
+fails at startup. `failure_mode` is set where the
+backend is consumed, since the same backend can be
+advisory for one filter and enforcement for another.
+`timeout` bounds every operation, and a backend that
+omits it gets a conservative default for its kind. The
+local defaults take a `path`; only external backends
+take a `url`. The schema follows the usual conventions:
+`snake_case` enums, `deny_unknown_fields`, `try_from`
+newtypes for bounded numbers, and `${ENV}` for secrets.
+
+Connectivity fields on external backends (`url`, TLS,
+auth) are a placeholder for the shared service
+definition being drafted separately. When it lands, a
+backend references a service by name instead of
+carrying its own connection fields, so state backends
+and upstream clusters share one definition of TLS and
+auth. This proposal does not define that service model
+and does not block on it.
+
+#### Contract enforcement
+
+TTL, size limits, timeouts, and metrics live in the
+registry wrapper, so every backend gets them and none
+can skip them. Per-entry limits are checked in the
+wrapper before a write reaches the backend. Per-tenant
+quotas are exact on the local defaults, which see every
+write, and best-effort on distributed backends, which
+would need their own usage accounting; the wrapper
+records what it can and the backend's native quotas do
+the rest. Metrics record latency and outcome per
+operation, labeled by backend name, kind, and operation
+only, never by tenant, key, or prompt, which would wreck
+cardinality. Encryption at rest is a hook with a null
+default; backends that encrypt natively (PostgreSQL,
+S3) report it through the hook, and proxy-managed
+envelope encryption comes later, since it has to work
+with the version-token compare-and-set and needs key
+management.
+
+#### Default backends
+
+- **In-memory key-value:** a new type with TTL, tenant
+  scoping, and per-tenant quota. This is the zero-config
+  default for the key-value variant and the backend the
+  admin key-value endpoints move onto.
+- **SQLite file** (feature `sql`): the zero-config
+  default for the SQL variant. It reuses the pool,
+  schema-version, and identifier-validation code the AI
+  stores already have. The default points at a file,
+  never in-memory SQLite (one connection, gone on
+  reload). A Rust-native embedded SQL engine could
+  replace it later; nothing in the trait assumes SQLite.
+- **Local filesystem object store:** the default for
+  the object variant, a first-class backend rather than
+  a demo stub. It uses tenant-prefixed paths, atomic
+  write-then-rename, and a background TTL sweep. An
+  in-memory object store exists for tests.
+
+`ObjectStore` is a contract, not a storage technology:
+any backend that offers put, get, head, delete, and
+list-by-prefix over opaque blobs qualifies, whether it
+is a POSIX filesystem, an in-memory map, an
+S3-compatible service, or an embedded store such as
+RocksDB. The filesystem backend is the local default
+because it needs nothing installed, not because it is a
+demo. It lists by walking the directory under the
+tenant prefix and has no multipart or tagging, which the
+contract does not require. The `list` cursor is opaque
+per backend (a continuation token on S3, the last path
+on the filesystem).
+
+`sqlx` stays behind the `sql` feature, out of a default
+`praxis-core` library build. The `praxis` server binary
+turns the feature on so the SQLite default works out of
+the box; embedding consumers opt in.
+
+#### Adapting the AI repo
+
+None of this is a rewrite:
+
+1. Keep `ResponseStore` and `ConversationItemStore` as
+   domain traits; their transaction and pagination
+   behavior is unchanged. They take a `SqlStore` handle
+   from the registry instead of building their own
+   pool.
+2. Register the backend into the core `StateRegistry`
+   at startup, instead of the current per-pipeline
+   `ResponseStoreRegistry` that is rebuilt on every
+   reload and filled lazily under one `"default"` key.
+   That one change fixes reload survival, probe and
+   admin access, the one-store-per-instance limit, and
+   the ordering dependency between the store and
+   rehydrate filters.
+3. Move the generic pieces (pool config, SSL and SSRF
+   validation, table-identifier checks, schema
+   versioning) into the core SQLite and PostgreSQL
+   backends, and collapse the two duplicated config
+   structs and `StorageBackend` enums into the `state:`
+   block.
+4. Swap the serialized-JSON compare-and-swap for the
+   version-token form.
+5. Keep the existing DDL, table names, and schema
+   version so no deployment needs a data migration.
+   Operators do move `backend:` and `database_url:`
+   from each filter into one `state.sql` entry and
+   reference it by name; the release notes carry that
+   mapping.
+
+The reference schema for responses and conversations
+(the reference-schema graduation criterion) lives with
+the domain store, not behind the generic trait.
+
+#### Ephemeral and storage are separate
+
+They differ in durability and concurrency, not size.
+Ephemeral state is a hot-path cache that can be lost on
+restart; storage state is durable, off the hot path, and
+usually network-backed. The traits follow that line:
+`KvStore` is the ephemeral variant and its backends may
+drop data on restart, while `SqlStore` and `ObjectStore`
+are the durable variants and their backends must not.
+One trait cannot do both well: the hot path needs cheap
+access, while a durable backend needs `async` I/O with a
+timeout on every call. Fold them together and blocking
+I/O ends up on the request path, which Part 1 rules out.
+`Capabilities::durable` makes the line visible at
+runtime, so a consumer that needs durability can check
+for it.
+
+#### SQL is a core variant
+
+SQL is the third core variant, not a consumer-side
+concern. Core owns the `SqlStore` trait, the SQLite and
+PostgreSQL backends behind the `sql` feature, and the
+schema-version hook. Relational domain traits
+(`ResponseStore`, `ConversationItemStore`, the Files API
+catalog) build on a `SqlStore` handle and own their own
+DDL. That keeps compare-and-swap, transactional writes,
+and keyset pagination available to the domain stores
+without bending a generic key-value trait until it
+becomes a database, and it gives every deployment a
+working SQL default with no external service. This
+settles the point on which the two source proposals
+disagreed.
+
+#### KvStore supersedes KvBackend
+
+Two key-value abstractions in core is the outcome Part 1
+exists to prevent, so `KvStore` replaces `KvBackend`
+rather than sitting beside it. `KvBackend` has no TTL,
+tenancy, quota, or async I/O, and its only consumers are
+the admin key-value endpoints and filters that call
+`get_or_create` on demand. The path: land `KvStore` and
+the in-memory default; point the admin `/api/kv`
+endpoints at a named `KvStore` backend; migrate the
+built-in consumers; deprecate `KvBackend` and
+`KvStoreRegistry` for one release; remove them. The
+sticky-session `SessionStoreRegistry` and the policy
+engine's `SessionStore` are key-value-with-TTL consumers
+and migrate onto `KvStore` in the same pass, so the
+policy engine's Valkey session store becomes the core
+Valkey backend instead of a second client stack.
+
+#### Backends and their state survive reload
+
+The registry is built once and re-attached to each
+rebuilt pipeline, the way `KvStoreRegistry` and
+`HealthRegistry` already work. A backend reconnects only
+when its own config changes, and a teardown is logged.
+
+#### Not in this proposal
+
+- Cache APIs with load-through and coalescing (the
+  policy engine's `moka` token cache, `tinyufo`, the
+  per-IP rate-limit maps). Part 1 keeps caches separate
+  from state; they may later be built on `KvStore` but
+  are not a variant here.
+- Replicated, gossip-based state (the Grid `crdt`
+  crate's LWW registers, OR-sets, and G-counters). A
+  CRDT-backed `KvStore` is possible later; the
+  state-class table treats it as a shared hot-path
+  backend without a central server.
+- Append-only sinks for audit and usage export. Part 1
+  exports durable business state asynchronously; the
+  sink interface is a separate proposal.
+- Service lifecycle and the shared service definition
+  (endpoints, TLS, auth). Backend connectivity fields
+  adopt it when it lands; this proposal does not define
+  it.
+- Scripted atomic ledgers (the token rate limit's
+  reserve/reconcile `EVAL` scripts). The typed domain
+  layer in proposal 00121 owns them and borrows the
+  Valkey pool from the named backend rather than
+  opening its own.
+
+### Experimental Phase
+
+This is core infrastructure and a configuration schema
+change, both exempt categories, so
+`experimental_exempt: true` is set. The alternative path
+is the cargo feature: external backends land behind
+`valkey`, `sql`, and object-storage features that are
+off in the core library, and the `state:` block itself
+lands behind the `experimental` build tag until the
+trait API graduates.
+
+### Implementation
+
+The work splits into steps that can each land on their
+own:
+
+1. Core types and traits (`Scope`, `Version`,
+   `Capabilities`, `KvStore`, `SqlStore`,
+   `ObjectStore`), `StateRegistry`, the `state:`
+   config, and the local defaults (in-memory key-value,
+   SQLite file, filesystem objects), wired through the
+   pipeline, reload, and the ExtProc server.
+2. Background TTL sweep and eviction, plus the reload
+   warning on stateful teardown.
+3. The `sql` feature backends (SQLite, PostgreSQL) and
+   the AI move above.
+4. Migrations onto `KvStore`: the admin `/api/kv`
+   endpoints, the sticky-session `SessionStoreRegistry`,
+   the policy engine's `SessionStore`; then deprecate
+   `KvBackend`.
+5. Distributed backends (Valkey, S3/GCS/Rados) for
+   multi-replica correctness, and the token rate
+   limit's Valkey ledger borrowing the shared pool.
+6. Follow-ups: encryption at rest, retention policies,
+   object tagging, and a load-link/store-conditional
+   form of conditional writes.
+
+Every praxis change carries unit and integration tests,
+an example under `examples/configs/state/`, and a
+functional test for it.
+
+## Notes
+
+> **Merge note:** This proposal merges the former ENH #99
+> (Stateful Proxy State Management) and ENH #412 (Storage
+> Layer). #412 tracked the pluggable backend traits beneath
+> #99's state model and was on hold; its content is folded
+> in here and it is superseded by this proposal. Part 1 is
+> the state model and typed domain APIs (from #99). Part 2
+> is the unified state interface and the storage backend
+> traits (from #99's interface section and #412). The one
+> point where the two proposals disagreed, whether SQL is a
+> first-class backend, is settled in the How? section: SQL
+> is a core variant with a local default.
