@@ -15,6 +15,7 @@ graduation_criteria:
   - State class taxonomy agreed by stakeholders
   - Scoping model (tenant plus consumer namespace; filter, chain, or global access) agreed by stakeholders
   - Storage trait API design (KvStore, SqlStore, ObjectStore) reviewed by stakeholders
+  - KvStore value model (typed values, per-backend encoding) and conditional-write form (versions or load-link/store-conditional) settled by a written comparison with usage examples
   - SQL as a core variant with a SQLite file default agreed by stakeholders
   - Every variant has a local default implementation that runs with no external service
   - KvBackend deprecation path agreed by stakeholders
@@ -307,9 +308,9 @@ one key-value abstraction rather than two.
   lifecycle.
 - Define three storage backend traits accessible to
   filters via `HttpFilterContext`:
-  - **Key-value trait**: small values, low latency,
-    keyed lookups. Backends: in-memory (default),
-    Valkey/Redis (multi-replica).
+  - **Key-value trait**: small typed values, low
+    latency, keyed lookups. Backends: in-memory
+    (default), Valkey/Redis (multi-replica).
   - **SQL trait**: relational records with
     transactions and keyset pagination. Backends:
     SQLite file (default), PostgreSQL (multi-replica).
@@ -679,6 +680,13 @@ pub struct Scope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Version(u64);
 
+/// The core value type (`String`, `Bytes`, `Bool`,
+/// `Int(i64)`, `UInt(u64)`, `Double(f64)`) from the
+/// core type system work (praxis-proxy/praxis#1234).
+/// `KvStore` reuses it; this proposal does not define
+/// its own.
+pub use crate::value::Value;
+
 /// What a backend can promise.
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
@@ -759,17 +767,23 @@ tenant-scoped by the domain schema that owns them.
 pub trait KvStore: Send + Sync + Debug {
     fn capabilities(&self) -> Capabilities;
     async fn get(&self, scope: &Scope, key: &str)
-        -> Result<Option<Bytes>, StateError>;
+        -> Result<Option<Value>, StateError>;
+    /// Value and version together, so a
+    /// read-modify-write never needs a probing CAS.
+    /// Provisional; see "Conditional writes".
+    async fn get_versioned(&self, scope: &Scope,
+        key: &str)
+        -> Result<Option<(Value, Version)>, StateError>;
     async fn set(&self, scope: &Scope, key: &str,
-        val: Bytes, ttl: Option<Duration>)
+        val: Value, ttl: Option<Duration>)
         -> Result<(), StateError>;
     async fn delete(&self, scope: &Scope, key: &str)
         -> Result<bool, StateError>;
-    /// Conditional write on an opaque version token,
-    /// not on serialized value bytes.
+    /// Conditional write on an opaque version token.
+    /// Provisional; see "Conditional writes".
     async fn compare_and_set(&self, scope: &Scope,
         key: &str, expected: Option<Version>,
-        val: Bytes, ttl: Option<Duration>)
+        val: Value, ttl: Option<Duration>)
         -> Result<Version, StateError>;
     async fn incr_by(&self, scope: &Scope, key: &str,
         delta: i64, ttl: Option<Duration>)
@@ -830,37 +844,66 @@ take a `SqlStore` handle and install their schema
 through `ensure_schema`, instead of registering beside
 the generic traits.
 
-**Conditional writes.** `compare_and_set` with
-`expected: None` succeeds only when the key is absent
-(create-if-absent); with `Some(v)` it succeeds only
-when the key's current version equals `v`. Success
-returns the new `Version`. Failure returns
-`StateError::PreconditionFailed { current }`, carrying
-the key's current version (or `None` if it no longer
-exists) so the caller can re-read and retry without a
-second round trip. `Version` is `Copy`, backend
-assigned, monotonic per key, and never derived from
-the value bytes, so two writers storing equal bytes
-still get distinct versions. A plain `set` bumps the
-version too. A load-link/store-conditional form, where
-only in-flight pairs carry a version, is a possible
-follow-up if per-entry versions prove too heavy; the
-signature above does not preclude it.
+**Values.** `KvStore` speaks the core `Value` type,
+not raw bytes, so two consumers never have to agree on
+a byte encoding to share a key, and the typed domain
+layer gets integers and strings back as what they
+are. Each backend owns how it encodes a `Value` and
+keeps enough type information to hand back the variant
+it stored. The in-memory backend keeps the enum as is.
+An embedded store is free to use fixed-width or varint
+integers. The Valkey backend stores integers as decimal
+strings, because that is the only form `INCRBY`
+accepts, so `incr_by` is one native command and a
+plain `GET` still reads the key. A backend whose data
+is shared across replicas treats its encoding as a
+versioned wire format, since a rolling upgrade has two
+Praxis versions reading the same keys. `max_entry_bytes`
+applies to the encoded value. `ObjectStore` stays
+bytes: its values are blobs. Where `Value` lives so the
+policy engine can speak the same contract without
+depending on Praxis is settled with the type system
+work, not here.
 
-**Counters.** `incr_by` treats the value as a decimal
-ASCII integer, the encoding Valkey's `INCRBY` requires,
-so a `get` after `incr_by` returns readable bytes and a
-`set` of `b"41"` followed by `incr_by(1)` yields `42`.
-An absent key counts as `0`. `delta` may be negative; a
-value that is not a decimal integer, or a result
-outside `i64`, fails with `StateError::InvalidValue`.
-For `incr_by` and `set` alike, `ttl: Some(d)` sets or
-refreshes the key's expiry, while `ttl: None` leaves an
-existing expiry alone and gives a new key the backend's
-`ttl_default`. Values are bytes at this boundary on
-purpose: the typed domain layer chooses encodings, and
-a typed value layer can sit on top without changing
-the trait.
+**Conditional writes.** The form here is provisional.
+`compare_and_set` with `expected: None` succeeds only
+when the key is absent (create-if-absent); with
+`Some(v)` it succeeds only when the key's current
+version equals `v`. Success returns the new `Version`.
+Failure returns `StateError::PreconditionFailed
+{ current }` with the key's current version, or `None`
+if it no longer exists. `get_versioned` returns the
+value and its version together, so a read-modify-write
+is one read and one conditional write, never a CAS
+issued only to learn the version. `Version` is `Copy`,
+backend assigned, monotonic per key, and never derived
+from the value, so two writers storing equal values
+still get distinct versions; `set` and `incr_by` bump
+it too. The alternative is a load-link/store-conditional
+form, where only in-flight pairs carry a token and the
+backend stores no version per entry. The two differ in
+cost on Valkey, where a per-key version turns every
+write into a script or hash update while
+`WATCH`/`MULTI`/`EXEC` is itself load-link shaped but
+pins a connection per pair, and they differ in how
+pleasant they are to use. A written comparison of the
+two forms with worked usage examples settles which one
+the trait ships; that is a graduation criterion, and
+`get_versioned` is the stopgap it replaces if load-link
+wins.
+
+**Counters.** `incr_by` operates on integer values. An
+absent key counts as `0`; a stored `Value::Int` is
+adjusted by `delta` and the result returned; any other
+variant, or a result outside `i64`, fails with
+`StateError::InvalidValue`. `delta` may be negative, so
+a gauge (an in-flight count) and a counter share one
+operation. Whether counters should instead be unsigned,
+as a rate limiter's are, is settled with the value
+comparison above. For `incr_by` and `set` alike,
+`ttl: Some(d)` sets or refreshes the key's expiry,
+while `ttl: None` leaves an existing expiry alone and
+gives a new key the backend's `ttl_default`.
 
 **Objects.** `head` returns metadata without the body,
 for size checks and conditional fetches. Multipart
@@ -1007,8 +1050,7 @@ cardinality. Encryption at rest is a hook with a null
 default; backends that encrypt natively (PostgreSQL,
 S3) report it through the hook, and proxy-managed
 envelope encryption comes later, since it has to work
-with the version-token compare-and-set and needs key
-management.
+with conditional writes and needs key management.
 
 #### Default backends
 
@@ -1070,8 +1112,8 @@ None of this is a rewrite:
    backends, and collapse the two duplicated config
    structs and `StorageBackend` enums into the `state:`
    block.
-4. Swap the serialized-JSON compare-and-swap for the
-   version-token form.
+4. Swap the serialized-JSON compare-and-swap for a
+   version column in the domain schema.
 5. Keep the existing DDL, table names, and schema
    version so no deployment needs a data migration.
    Operators do move `backend:` and `database_url:`
@@ -1187,7 +1229,11 @@ own:
    `ObjectStore`), `StateRegistry`, the `state:`
    config, and the local defaults (in-memory key-value,
    SQLite file, filesystem objects), wired through the
-   pipeline, reload, and the ExtProc server.
+   pipeline, reload, and the ExtProc server. The
+   registry, config, lifecycle, and reload work can
+   land first; the `KvStore` operations wait on the
+   core `Value` type and the conditional-write
+   comparison.
 2. Background TTL sweep and eviction, plus the reload
    warning on stateful teardown.
 3. The `sql` feature backends (SQLite, PostgreSQL) and
@@ -1200,8 +1246,7 @@ own:
    multi-replica correctness, and the token rate
    limit's Valkey ledger borrowing the shared pool.
 6. Follow-ups: encryption at rest, retention policies,
-   object tagging, and a load-link/store-conditional
-   form of conditional writes.
+   and object tagging.
 
 Every praxis change carries unit and integration tests,
 an example under `examples/configs/state/`, and a
