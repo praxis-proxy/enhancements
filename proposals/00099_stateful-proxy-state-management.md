@@ -1032,7 +1032,9 @@ state:
       max_tenant_bytes: 16_777_216    # 16 MiB
     - name: ledger
       kind: valkey
-      url: ${VALKEY_URL}
+      url: valkey://valkey.internal:6379
+      credential:
+        env_var: VALKEY_PASSWORD    # or value: ...
       scope: global
       timeout: 100ms
   sql:
@@ -1094,8 +1096,15 @@ advisory for one filter and enforcement for another.
 omits it gets a conservative default for its kind. The
 local defaults take a `path`; only external backends
 take a `url`. The schema follows the usual conventions:
-`snake_case` enums, `deny_unknown_fields`, `try_from`
-newtypes for bounded numbers, and `${ENV}` for secrets.
+`snake_case` enums, `deny_unknown_fields`, and
+`try_from` newtypes for bounded numbers. A credential
+sits in its own field as either a literal `value` or an
+`env_var` reference, the convention the credential
+filters already use, and the config dump's redaction of
+those keys extends to the `state:` block; a credential
+never rides in the `url`, which ends up in logs. Praxis
+has no `${VAR}` interpolation, and this proposal does
+not add one.
 
 Connectivity fields on external backends (`url`, TLS,
 auth) are a placeholder for the shared service
@@ -1123,7 +1132,8 @@ cardinality. Encryption at rest is a hook with a null
 default; backends that encrypt natively (PostgreSQL,
 S3) report it through the hook, and proxy-managed
 envelope encryption comes later, since it has to work
-with conditional writes and needs key management.
+with conditional writes and takes its keys from the
+secrets interface that is out of scope here.
 
 For SQL the wrapper is `SqlHandle::run`. It applies the
 backend `timeout` to the whole operation, records
@@ -1322,6 +1332,19 @@ when its own config changes, and a teardown is logged.
   layer in proposal 00121 owns them and borrows the
   Valkey pool from the named backend rather than
   opening its own.
+- Secrets management (Vault, KMS, HSM). A secrets store
+  has its own contract: read-only, resolved at startup
+  and on refresh rather than per request, zeroized on
+  drop, never in errors or logs, and addressed by name.
+  That is a different store from the three here, so it
+  gets its own interface and its own epic rather than
+  a fourth variant. The policy engine's `SecretProvider`
+  (env, file, and Vault backends) is the shape to lift
+  into core. When it lands, backend credentials become
+  named secrets instead of `env_var` references, and
+  the encryption-at-rest follow-up takes its keys from
+  the same interface; an HSM belongs there as a
+  key-wrap backend, not here as storage.
 
 ### Experimental Phase
 
