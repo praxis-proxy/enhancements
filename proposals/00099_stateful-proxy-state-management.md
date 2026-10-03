@@ -302,7 +302,8 @@ one key-value abstraction rather than two.
   key-value, SQLite file, local filesystem). Valkey,
   PostgreSQL, and S3-compatible backends are opt-in
   cargo features. External crates provide additional
-  backends without modifying core.
+  key-value and object backends without modifying
+  core; SQL backends are a closed set owned by core.
 - Accessible to filters and to probes (background
   processes), decoupled from the HTTP request
   lifecycle.
@@ -507,8 +508,10 @@ lost on restart.
 
 **SQL**: response records, conversation items,
 pending approvals, catalogs. Rows with indexes,
-transactions, and keyset pagination, read and written
-once per request off the hot path. Must survive
+transactions, and keyset pagination. On the request
+path only for the requests that carry state (a
+`previous_response_id`, a `conversation`), never per
+token and never for every request. Must survive
 restarts. The Responses and Conversations stores
 already depend on transactional writes and
 compare-and-swap that neither a key-value nor a blob
@@ -527,6 +530,20 @@ adds unnecessary overhead for a 64-byte counter. A
 relational interface is the wrong shape for either.
 Different access patterns warrant different
 abstractions, and each one gets a local default.
+
+Choosing between them follows one rule: `SqlStore` is
+the last resort. Its latency is the least predictable
+of the three, because a query's cost depends on the
+plan, the indexes, the table size, and lock contention,
+none of which Praxis controls, and a long `UPDATE` or a
+forgotten index lands on Praxis directly. Use it only
+where a domain needs transactions, relational queries,
+or keyset pagination over durable records, and never
+for state every request touches (counters, flags,
+affinity, per-request policy state), which belongs in
+`KvStore`. A consumer that reaches SQL on the request
+path gates it so only the requests that need it get
+there.
 
 #### Why Object Stores
 
@@ -582,8 +599,8 @@ takes seconds.
   caching, and session tracking so that each
   feature does not build its own storage layer.
 - As a Praxis developer, I want to add a new
-  storage backend in an external crate without
-  modifying core.
+  key-value or object storage backend in an external
+  crate without modifying core.
 - As a probe author, I want access to the same
   state backends that filters use so that
   background processes share state without a
@@ -611,10 +628,14 @@ takes seconds.
 - One registry, built from config at startup, that
   survives pipeline reload and is reachable from
   filters, probes, and background tasks.
-- Every backend honors one contract: tenant isolation,
-  per-entry TTL where the variant supports it, size
-  limits, a timeout on every operation, and a
-  per-consumer failure mode.
+- Every backend honors one contract: tenant isolation
+  (enforced by the registry wrapper for key-value and
+  object, and by the owning domain schema for SQL,
+  where every domain store keys rows by tenant and
+  proves it with a cross-tenant-read test), per-entry
+  TTL and size limits where the variant supports them,
+  a timeout on every operation, and a per-consumer
+  failure mode.
 - A backend declares its capabilities (shared across
   replicas, atomic operations, durable) so a consumer
   can refuse a configuration that cannot enforce what
@@ -639,11 +660,13 @@ takes seconds.
   tasks by clone.
 - A top-level `state:` config block declaring named
   backends grouped by variant (`kv`, `sql`, `object`),
-  each with a kind, an access scope (filter, chain,
-  global), a timeout, and limits.
+  each with a kind, a timeout, and limits, and an
+  access scope (filter, chain, global) on key-value and
+  object entries.
 - Every backend honors the contract: tenant isolation,
-  per-entry TTL, per-entry and per-tenant size limits,
-  a timeout on every operation, and a per-consumer
+  per-entry TTL and per-entry and per-tenant size
+  limits where the variant supports them, a timeout on
+  every operation, and a per-consumer
   `failure_mode: open | closed`.
 - Local defaults so Praxis runs with no external
   service: an in-memory key-value store (with TTL,
@@ -653,7 +676,8 @@ takes seconds.
 - Valkey/Redis, PostgreSQL, and S3-compatible
   (including MinIO), GCS, and Rados backends live
   behind opt-in cargo features; external crates can
-  add backends without changing core.
+  add key-value and object backends without changing
+  core.
 - `KvStore` supersedes the existing `KvBackend`
   runtime cache over a deprecation window.
 - The AI Responses/Conversations stores move onto the
@@ -698,7 +722,16 @@ pub struct Capabilities {
     pub durable: bool,
 }
 
+/// One variant per dialect core ships.
+#[non_exhaustive]
 pub enum SqlDialect { Sqlite, Postgres }
+
+/// The `sqlx` pool behind a SQL backend.
+#[non_exhaustive]
+pub enum SqlPool {
+    Sqlite(sqlx::SqlitePool),
+    Postgres(sqlx::PgPool),
+}
 
 /// A named, versioned set of DDL statements a domain
 /// store installs once per backend.
@@ -759,7 +792,7 @@ durability checks `durable` the same way.
 
 All three traits are `async` and `Send + Sync`. Every
 `KvStore` and `ObjectStore` call takes a `Scope`.
-`SqlStore` hands out a connection; its rows are
+`SqlStore` hands out a pool; its rows are
 tenant-scoped by the domain schema that owns them.
 
 ```rust
@@ -794,10 +827,9 @@ pub trait KvStore: Send + Sync + Debug {
 pub trait SqlStore: Send + Sync + Debug {
     fn capabilities(&self) -> Capabilities;
     fn dialect(&self) -> SqlDialect;
-    /// Pooled connection, bounded by the backend
-    /// timeout.
-    async fn acquire(&self)
-        -> Result<SqlConnection, StateError>;
+    /// The `sqlx` pool for the dialect. Reached only
+    /// through `SqlHandle::run`.
+    fn pool(&self) -> &SqlPool;
     /// Install a domain schema once, keyed by name
     /// and version.
     async fn ensure_schema(&self, schema: &SchemaSpec<'_>)
@@ -833,16 +865,28 @@ expect misses (a TTL expiry is a miss) handle one code
 path. Object bodies stream instead of buffering whole
 blobs, since attachments run up to 32 MiB.
 
-`SqlConnection` wraps the pooled connection for the
-dialect (an `sqlx` connection today; nothing in the
-trait assumes `sqlx`). The traits are the backend
+`SqlStore` is `sqlx` on purpose. A domain store has to
+run queries, so either the handle exposes `sqlx` types
+or core grows a query layer of its own, which is the
+bend-a-trait-until-it-is-a-database outcome this
+proposal rejects. `SqlPool` is a `#[non_exhaustive]`
+enum over the `sqlx` pool per dialect, `praxis-core`
+re-exports `sqlx` under the `sql` feature so consumers
+never land on a second copy with mismatched types, and
+a `sqlx` major bump is a breaking change for the `sql`
+feature, which is acceptable before 1.0. SQL backends
+are therefore a closed set owned by core: a new dialect
+is a core change, unlike key-value and object backends,
+which external crates can add. Domain stores write
+dialect-specific SQL inside `SqlHandle::run`, the only
+way to reach the pool. The traits are the backend
 layer. The typed domain APIs from Part 1 (rate limits,
 token ledgers, sessions) are the usual filter-facing
 surface and build on top of them. Relational domain
-traits (`ResponseStore`, `ConversationItemStore`)
-take a `SqlStore` handle and install their schema
-through `ensure_schema`, instead of registering beside
-the generic traits.
+traits (`ResponseStore`, `ConversationItemStore`) take
+a `SqlHandle` and install their schema through
+`ensure_schema`, instead of registering beside the
+generic traits.
 
 **Values.** `KvStore` speaks the core `Value` type,
 not raw bytes, so two consumers never have to agree on
@@ -928,12 +972,33 @@ pub struct StateRegistry { /* Arc<inner> */ }
 impl StateRegistry {
     pub fn kv(&self, name: &str)
         -> Option<Arc<dyn KvStore>>;
-    pub fn sql(&self, name: &str)
-        -> Option<Arc<dyn SqlStore>>;
+    pub fn sql(&self, name: &str) -> Option<SqlHandle>;
     pub fn object(&self, name: &str)
         -> Option<Arc<dyn ObjectStore>>;
 }
+
+/// A SQL backend behind the timeout and metrics
+/// wrapper; the only way to reach its pool.
+#[derive(Clone, Debug)]
+pub struct SqlHandle { /* Arc<dyn SqlStore> + limits */ }
+
+impl SqlHandle {
+    pub fn dialect(&self) -> SqlDialect;
+    /// Run one named operation with the backend
+    /// timeout applied and its latency and outcome
+    /// recorded.
+    pub async fn run<T>(&self, op: &'static str,
+        f: impl AsyncFnOnce(&SqlPool)
+            -> Result<T, sqlx::Error>)
+        -> Result<T, StateError>;
+}
 ```
+
+`sql` returns a `SqlHandle` rather than a bare trait
+object so every query, not only pool checkout, passes
+through the timeout and metrics wrapper. The `kv` and
+`object` handles are wrapped the same way inside the
+registry.
 
 The difference is where backends come from.
 `KvStoreRegistry::get_or_create` hardcodes the in-memory
@@ -1010,11 +1075,19 @@ filters:
       failure_mode: closed  # open | closed
 ```
 
-Backends are filter-scoped by default; chain or global
-scope is opt-in per backend. A filter names the backend
-it wants (`store: convo`) and gets a typed handle; a
-consumer that asks for a `kv` handle by a `sql` name
-fails at startup. `failure_mode` is set where the
+Key-value and object backends are filter-scoped by
+default; chain or global scope is opt-in per backend,
+and `Scope::namespace` carries the choice on every
+call. A `sql` entry takes no `scope` and the schema
+rejects one: `SqlStore` never sees a `Scope`, so
+sharing and tenancy are the owning domain schema's
+business, and any consumer that names the backend may
+use it, which is how the AI store, rehydrate,
+conversations, and compact filters share `convo`. A
+filter names the backend it wants (`store: convo`) and
+gets a typed handle; a consumer that asks for a `kv`
+handle by a `sql` name fails at startup.
+`failure_mode` is set where the
 backend is consumed, since the same backend can be
 advisory for one filter and enforcement for another.
 `timeout` bounds every operation, and a backend that
@@ -1052,6 +1125,29 @@ S3) report it through the hook, and proxy-managed
 envelope encryption comes later, since it has to work
 with conditional writes and needs key management.
 
+For SQL the wrapper is `SqlHandle::run`. It applies the
+backend `timeout` to the whole operation, records
+latency and outcome under the operation name, and maps
+`sqlx` errors onto `StateError`, so the rule that no
+backend skips the contract holds for every query and
+not only for pool checkout. The timeout is pushed
+server-side too, so a query the caller gave up on stops
+holding a connection and the database: the PostgreSQL
+backend derives `statement_timeout` and `lock_timeout`
+from the backend `timeout` and sets them in the
+connection options rather than the URL, the SQLite
+backend sets `busy_timeout` from it and aborts long
+statements through a progress handler, and each pool's
+`acquire_timeout` defaults to the backend `timeout`
+instead of `sqlx`'s 30 seconds. Each named backend has
+its own pool, so one slow consumer cannot drain
+another's connections, and the metrics include pool
+saturation (in use, idle, waiting) per backend. One
+operator note follows from `lock_timeout`: DDL and bulk
+rewrites against a live backend belong in a maintenance
+window, since they now turn into fast failures (closed,
+for rehydration) rather than slow requests.
+
 #### Default backends
 
 - **In-memory key-value:** a new type with TTL, tenant
@@ -1063,8 +1159,12 @@ with conditional writes and needs key management.
   schema-version, and identifier-validation code the AI
   stores already have. The default points at a file,
   never in-memory SQLite (one connection, gone on
-  reload). A Rust-native embedded SQL engine could
-  replace it later; nothing in the trait assumes SQLite.
+  reload), and runs in WAL mode so readers never wait
+  on the single writer, with `busy_timeout` taken from
+  the backend `timeout`. A Rust-native embedded engine
+  could replace it later as another dialect behind a
+  `sqlx` driver; `SqlDialect` and `SqlPool` are
+  `#[non_exhaustive]` for that reason.
 - **Local filesystem object store:** the default for
   the object variant, a first-class backend rather than
   a demo stub. It uses tenant-prefixed paths, atomic
@@ -1089,13 +1189,25 @@ on the filesystem).
 turns the feature on so the SQLite default works out of
 the box; embedding consumers opt in.
 
+The FIPS build is the one exception to "every variant
+has a local default". The `sqlx` facade enables its
+`migrate` feature unconditionally, which pulls in
+`sha2`, a crate the FIPS dependency gate denies, so the
+FIPS binary is built without `sql`, has no SQL variant,
+and rejects a `state.sql` block at startup with an
+error that says so. The carve-out lifts when upstream
+`sqlx` makes `migrate` optional in the facade;
+PostgreSQL authentication pulls `md-5` and `hmac` on
+top, so it stays out of the FIPS build longer than
+SQLite does.
+
 #### Adapting the AI repo
 
 None of this is a rewrite:
 
 1. Keep `ResponseStore` and `ConversationItemStore` as
    domain traits; their transaction and pagination
-   behavior is unchanged. They take a `SqlStore` handle
+   behavior is unchanged. They take a `SqlHandle`
    from the registry instead of building their own
    pool.
 2. Register the backend into the core `StateRegistry`
@@ -1129,15 +1241,17 @@ the domain store, not behind the generic trait.
 
 They differ in durability and concurrency, not size.
 Ephemeral state is a hot-path cache that can be lost on
-restart; storage state is durable, off the hot path, and
-usually network-backed. The traits follow that line:
+restart; storage state is durable, reached only by the
+requests that need it, and usually network-backed. The
+traits follow that line:
 `KvStore` is the ephemeral variant and its backends may
 drop data on restart, while `SqlStore` and `ObjectStore`
 are the durable variants and their backends must not.
 One trait cannot do both well: the hot path needs cheap
 access, while a durable backend needs `async` I/O with a
-timeout on every call. Fold them together and blocking
-I/O ends up on the request path, which Part 1 rules out.
+timeout on every call. Fold them together and durable
+I/O ends up on every request path, which Part 1 rules
+out.
 `Capabilities::durable` makes the line visible at
 runtime, so a consumer that needs durability can check
 for it.
@@ -1149,12 +1263,13 @@ concern. Core owns the `SqlStore` trait, the SQLite and
 PostgreSQL backends behind the `sql` feature, and the
 schema-version hook. Relational domain traits
 (`ResponseStore`, `ConversationItemStore`, the Files API
-catalog) build on a `SqlStore` handle and own their own
-DDL. That keeps compare-and-swap, transactional writes,
-and keyset pagination available to the domain stores
+catalog) build on a `SqlHandle` and own their own DDL.
+That keeps compare-and-swap, transactional writes, and
+keyset pagination available to the domain stores
 without bending a generic key-value trait until it
-becomes a database, and it gives every deployment a
-working SQL default with no external service. This
+becomes a database, and it gives every deployment
+outside the FIPS build a working SQL default with no
+external service. This
 settles the point on which the two source proposals
 disagreed.
 
@@ -1227,17 +1342,18 @@ own:
 1. Core types and traits (`Scope`, `Version`,
    `Capabilities`, `KvStore`, `SqlStore`,
    `ObjectStore`), `StateRegistry`, the `state:`
-   config, and the local defaults (in-memory key-value,
-   SQLite file, filesystem objects), wired through the
-   pipeline, reload, and the ExtProc server. The
+   config, and the local defaults (in-memory key-value
+   and filesystem objects; SQLite is step 3), wired
+   through the pipeline, reload, and the ExtProc
+   server. The
    registry, config, lifecycle, and reload work can
    land first; the `KvStore` operations wait on the
    core `Value` type and the conditional-write
    comparison.
 2. Background TTL sweep and eviction, plus the reload
    warning on stateful teardown.
-3. The `sql` feature backends (SQLite, PostgreSQL) and
-   the AI move above.
+3. The `sql` feature: the SQLite file default, the
+   PostgreSQL backend, and the AI move above.
 4. Migrations onto `KvStore`: the admin `/api/kv`
    endpoints, the sticky-session `SessionStoreRegistry`,
    the policy engine's `SessionStore`; then deprecate
