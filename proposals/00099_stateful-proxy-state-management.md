@@ -316,7 +316,7 @@ one key-value abstraction rather than two.
     transactions and keyset pagination. Backends:
     SQLite file (default), PostgreSQL (multi-replica).
   - **Object store trait**: large payloads, higher
-    latency, blob storage. Backends: local filesystem
+    latency, blob storage. Backends: filesystem-backed
     (default), in-memory (tests), S3-compatible
     including MinIO, GCS, Rados (multi-replica).
 - Define the contract that all backend implementations
@@ -671,7 +671,7 @@ takes seconds.
 - Local defaults so Praxis runs with no external
   service: an in-memory key-value store (with TTL,
   tenancy, and quota), a SQLite file store, and a
-  local filesystem object store, plus an in-memory
+  filesystem-backed object store, plus an in-memory
   object store for tests.
 - Valkey/Redis, PostgreSQL, and S3-compatible
   (including MinIO), GCS, and Rados backends live
@@ -1033,6 +1033,7 @@ state:
     - name: ledger
       kind: valkey
       url: valkey://valkey.internal:6379
+      topology: standalone  # standalone | sentinel | cluster
       credential:
         env_var: VALKEY_PASSWORD    # or value: ...
       scope: global
@@ -1115,6 +1116,18 @@ and upstream clusters share one definition of TLS and
 auth. This proposal does not define that service model
 and does not block on it.
 
+Deployment topology is the backend's business too. A
+Valkey entry declares standalone, Sentinel, or Cluster
+mode in its `topology` field, and the backend handles
+discovery, slot routing, and failover through the
+client library; consumers never see a shard map, a
+Sentinel, or a reconnect. `KvStore` operations are
+single-key, so they are safe on Cluster without hash
+tags; a backend that stores a version beside a value
+keeps both under one key so that stays true. Multi-key
+scripted ledgers (proposal 00121) borrow the pool and
+own their own slot discipline.
+
 #### Contract enforcement
 
 TTL, size limits, timeouts, and metrics live in the
@@ -1175,7 +1188,7 @@ for rehydration) rather than slow requests.
   could replace it later as another dialect behind a
   `sqlx` driver; `SqlDialect` and `SqlPool` are
   `#[non_exhaustive]` for that reason.
-- **Local filesystem object store:** the default for
+- **Filesystem-backed object store:** the default for
   the object variant, a first-class backend rather than
   a demo stub. It uses tenant-prefixed paths, atomic
   write-then-rename, and a background TTL sweep. An
@@ -1186,13 +1199,21 @@ any backend that offers put, get, head, delete, and
 list-by-prefix over opaque blobs qualifies, whether it
 is a POSIX filesystem, an in-memory map, an
 S3-compatible service, or an embedded store such as
-RocksDB. The filesystem backend is the local default
-because it needs nothing installed, not because it is a
-demo. It lists by walking the directory under the
-tenant prefix and has no multipart or tagging, which the
-contract does not require. The `list` cursor is opaque
-per backend (a continuation token on S3, the last path
-on the filesystem).
+RocksDB. A filesystem is a POSIX store and an object
+store is a different category of system, which is why
+the default is named for what backs it: the
+filesystem-backed object store satisfies the object
+contract on local disk and offers none of the POSIX
+semantics (append, seek, rename, locking) that the
+contract leaves out. A consumer that needs those gets
+its own variant rather than a bent `ObjectStore`. The
+filesystem backend is the local default because it
+needs nothing installed, not because it is a demo. It
+lists by walking the directory under the tenant prefix
+and has no multipart or tagging, which the contract
+does not require. The `list` cursor is opaque per
+backend (a continuation token on S3, the last path on
+the filesystem).
 
 `sqlx` stays behind the `sql` feature, out of a default
 `praxis-core` library build. The `praxis` server binary
@@ -1326,7 +1347,11 @@ when its own config changes, and a teardown is logged.
 - Service lifecycle and the shared service definition
   (endpoints, TLS, auth). Backend connectivity fields
   adopt it when it lands; this proposal does not define
-  it.
+  it. State backends are host-owned and reached only
+  through handles, so a named backend can later be
+  provided by that service model without the traits
+  changing. Retries and circuit breaking belong to that
+  model, not here.
 - Scripted atomic ledgers (the token rate limit's
   reserve/reconcile `EVAL` scripts). The typed domain
   layer in proposal 00121 owns them and borrows the
