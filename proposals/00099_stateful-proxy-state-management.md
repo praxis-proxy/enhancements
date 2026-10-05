@@ -1,6 +1,5 @@
 ---
-issue: https://github.com/praxis-proxy/praxis/issues/99
-discussion: https://github.com/praxis-proxy/praxis/issues/99#issuecomment-4411378263
+issue: https://github.com/praxis-proxy/ai/issues/146
 status: proposed
 repos:
   - praxis
@@ -34,13 +33,14 @@ stakeholders:
   - twghu
   - rikatz
   - leseb
+  - alexsnaps
 origin:
   repo: praxis
-  issue: https://github.com/praxis-proxy/praxis/issues/99
+  issue: https://github.com/praxis-proxy/ai/issues/146
   file: 00099_stateful-proxy-state-management.md
 merged_from:
   - repo: ai
-    issue: https://github.com/praxis-proxy/praxis/issues/412
+    issue: https://github.com/praxis-proxy/ai/issues/147
     file: 00412_storage_layer.md
 ---
 
