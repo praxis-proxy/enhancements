@@ -36,6 +36,36 @@ This proposal establishes the semantic boundary that implementation and
 qualification must satisfy. It does not select the final public YAML/API
 fields or commit to a particular client-library implementation.
 
+### Current design
+
+The current experimental `token_rate_limit` filter has one reservation
+lifecycle, with two admission algorithms available per rule:
+`sliding_window` and `token_bucket`. Ordered rules select a budget from static
+header matches; a rule reserves a fixed `reserved_tokens` estimate against
+either one global bucket or a bucket derived from a verified authenticated
+subject.
+
+State is either process-local memory or a shared Valkey/Redis backend. The
+shared backend is configured once for the filter and its cached multiplexed
+connection is reused by the rules. Admission executes one Lua `EVAL` operation
+with the budget state, active reservations, settled usage, cleanup indexes,
+active counts, and reservation sequence supplied as explicit keys. A Valkey
+reconciliation is queued after the response so the response path does not wait
+for a second network round trip; in-process reconciliation is synchronous.
+
+At the end of the response stream, the filter uses provider-reported
+`token.total` when available and otherwise settles at the reserved estimate.
+The reservation handle, bucket key, and originating rule are carried through
+request metadata so settlement targets the same ledger entry. Admission
+backend failures fail closed rather than forwarding an unaccounted request.
+
+The committed backend's v1 key layout derives physical keys from the namespace,
+rule, and bucket, then adds namespace-level indexes. Those keys do not share one
+canonical Redis/Valkey Cluster hash tag, and the current Redis client connection
+is not the proposed native Cluster topology owner. Consequently, this proposal
+changes placement and topology ownership while preserving the reservation
+lifecycle and typed ledger operations described above.
+
 ### Scope
 
 There is one token-ledger path:
