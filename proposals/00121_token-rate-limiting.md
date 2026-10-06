@@ -74,9 +74,12 @@ estimation, what to do with unused tokens, etc.
 - **[M5]** Flexible bucket keys: quotas keyed by
   request information. Headers, model identity, or
   compound keys so different clients and models get
-  independent budgets. (TBD - may need further
-  scoping; see upstream [wg-ai-gateway-keys] effort
-  and related issues #123, #129, #232.)
+  independent budgets. One key partitions one
+  budget. It is not a stack of budgets. (TBD - may
+  need further scoping; see upstream
+  [wg-ai-gateway-keys] effort and related issues
+  #123, #129, #232. [ai#980] already partitions a
+  budget by authenticated subject.)
 - **[M6]** Hard deny with 429 when a budget is
   exhausted, with standard rate limit response headers
   (`Retry-After`, `X-RateLimit-*`).
@@ -114,15 +117,39 @@ estimation, what to do with unused tokens, etc.
   reserved capacity when a request times out, is
   dropped, or otherwise never completes.
 
+**Hierarchical quotas ([ai#125]):**
+
+- **[H1]** Hierarchical token quotas: on one request,
+  enforce three independent budgets in this order:
+  org, then team, then user. Each level has its own
+  limit. A user who is still inside their own budget
+  is denied when the org budget or the team budget
+  is exhausted. That parent-blocks-child outcome is
+  a hard deny. M5 is unchanged: one key still
+  partitions one budget. H1 is the stack of three
+  budgets, not a new key.
+
 ### Non-Goals
 
 - Replacing request-count rate limiting. Token and
   request-count quotas are independent concerns;
   operators may use both.
-- Identity resolution. This capability assumes client
-  identity has already been resolved to a request
-  header by an upstream component. We can re-assess
-  needs around this in later iterations.
+- Identity resolution. An upstream component resolves
+  the authenticated subject and sets the org and team
+  headers from memberships that subject is authorized
+  for. [H1] does not perform that check. We can
+  re-assess needs around this in later iterations.
+- For [H1] / [ai#125] only: groups of groups, policy
+  templates, and admin overrides. Orthogonal
+  groupings, applying one budget template to many
+  users, and temporarily raising a limit are not
+  part of this design.
+- Bucket-key composition inside [H1]. New key
+  sources and compound keys stay in M5 and [ai#123].
+  [ai#129] is closed as a duplicate of [ai#123].
+- A general overlapping-budget mechanism. Per-user
+  and global per-model budgets together are
+  [ai#979], not the fixed org / team / user stack.
 
 These are non-goals for this _iteration_ but are
 otherwise long term capabilities we do want.
@@ -231,6 +258,11 @@ backstop, not the first line of defense.
   need batch calls accounted for without starving
   real-time traffic.
 
+- As a **platform operator**, I need an org budget,
+  a team budget, and a user budget enforced on their
+  own, so a user who is under their own limit is
+  still stopped when the org limit is exhausted.
+
 ## How?
 
 ### Requirements
@@ -251,6 +283,10 @@ backstop, not the first line of defense.
 - Exact metering records independent of rate limit
   counters
 - Reservation cleanup on request failure or timeout
+- Independent org, team, and user token budgets on
+  one request. Each limit is enforced on its own.
+  When a parent budget blocks the child, the outcome
+  is a hard deny.
 
 ### Design
 
@@ -283,7 +319,10 @@ rejected with 429. Otherwise the request continues and
 inject headers from all currently exceeded soft tiers
 are unioned onto the request. If two budgets inject the
 same header name, the last budget in config order wins;
-prefer distinct header names per window.
+prefer distinct header names per window. Hourly and
+daily budgets on one rule share that rule's one
+bucket key. They are not the org / team / user stack
+in [H1].
 
 **Tiers:** each budget is a capacity ladder over a
 window. Thresholds use defined `capacity`. Every tier
@@ -438,21 +477,147 @@ rules:
       include_used: true
 ```
 
+#### Hierarchical budgets
+
+[M5] is one key per budget. [H1], tracked in
+[ai#125], is a stack of three budgets checked on the
+same request. Each level has its own limit and its
+own counter. The order is fixed: org, then team,
+then user.
+
+The levels do not share a pool. Each level that
+accepts the request reserves the same estimate.
+Remaining capacity is not disbursed from org to team
+or from team to user. This design does not add
+groups of groups, policy templates, or admin
+overrides.
+
+The `hierarchy` block is optional. Omit it and the
+filter keeps one budget and one key, as it does
+today. When the block is present it must be exactly
+three levels, org then team then user. Any other
+count or order is rejected when the config loads.
+
+**Parent blocks child, and that denial is a hard
+deny.** If the org budget cannot take the
+reservation, the request is rejected with 429 and
+the standard token rate-limit response headers, even
+when the team budget and the user budget both still
+have room. The same deny applies when the team
+budget is exhausted and the user budget is not. The
+filter does not turn that denial into a notification
+and continue the request.
+
+Notify-without-block stays [S1]. A parent budget
+in [H1] does not do that. It denies the request.
+
+**One admission.** Org is reserved first, then team,
+then user, inside a single `token_rate_limit`
+admission. If a later level denies, reservations
+already taken for earlier levels in that admission
+are released, and the request is rejected. A later
+level is not charged when an earlier level already
+denied. All three levels that kept a reservation are
+reconciled against the same actual usage. This does
+not add a new bucket key. The user level is the
+authenticated subject from [ai#980]. Org and team
+are headers an upstream component has already set.
+New key sources and compound keys remain M5 and
+[ai#123]. Simultaneous per-user and per-model
+budgets remain [ai#979]. After the three levels
+accept, the matched rule reserves as it does today.
+If a `deny` tier is hit, or `enforcement: hard`
+rejects that reservation, the three holds from this
+admission are released. If `enforcement: soft`
+forwards after that reservation is denied, those
+holds stay and are reconciled with the response.
+If that request is lost, cleanup releases them.
+
+A missing org header, missing team header, or
+missing authenticated subject is rejected with 401
+before any hold is placed, and no level is charged.
+Org and team header values, and the authenticated
+subject, are hashed before they are stored as
+counter keys. This filter does not check who wrote
+the org or team header. A trusted component upstream
+must strip a client-supplied value and set the
+header from a membership it has already authorized
+for the authenticated subject. The team it writes
+must be a team that subject belongs to, and the org
+must be that team's organization. That binding is
+the identity-resolution non-goal above. [H1] does
+not read a team list. The user level uses only the
+authenticated subject id.
+
+```yaml
+hierarchy:
+  - level: org
+    identity_header: x-org-id
+    algorithm: sliding_window
+    window: 1h
+    capacity: 5000000
+  - level: team
+    identity_header: x-team-id
+    algorithm: sliding_window
+    window: 1h
+    capacity: 1000000
+  - level: user
+    identity: authenticated_subject
+    algorithm: sliding_window
+    window: 1h
+    capacity: 100000
+```
+
+Each hierarchy level uses the same `algorithm`, `window`,
+and `capacity` fields a rule uses on the shipped filter.
+Those are the fields in the example above. A hierarchy
+level has one hard-deny capacity. It does not use
+graduated tiers, and it does not use a rule's
+`token_budgets` list. Estimation stays on the matched
+rule and is shared by all three levels.
+
+The rule list must include a catch-all rule, a rule
+with no `match`. Every rule must set `reserved_tokens`,
+or `estimation.fallback_estimate` greater than zero.
+`reserved_tokens` alone is enough. A request then
+always has a rule and a cost, so it cannot skip the
+org, team, and user checks by omitting a match header
+or a body field. Hierarchy admission still runs inside
+`token_rate_limit`, after that match and estimate.
+
+A request is admitted only when all three levels
+accept the same estimated cost. Which level denied
+is recorded on the accounting log as `org`, `team`,
+or `user`, and on the existing Prometheus metrics
+with `rule` set to `hierarchy:org`, `hierarchy:team`,
+or `hierarchy:user`. A configured rule must not use
+those three names.
+
 #### Request Lifecycle
 
 Each request passes through four phases:
 
-1. **Admission** - Match the request to a rule, compute
-   an estimated cost using the configured strategy, and
-   evaluate every `token_budget` on that rule. Inject
-   headers from exceeded soft tiers; if any budget hits
-   a `deny` tier, reject with 429. If the algorithm
-   denies the reservation, apply `enforcement`:
-   `hard` rejects with 429; `soft` forwards and does
-   not store a reservation, so
-   reconciliation and cleanup do not run for that
-   request. Estimation at admission can be optionally
-   disabled in favor of response-only accounting.
+1. **Admission** - Match the request to a rule and
+   compute an estimated cost. When [H1] is configured,
+   reserve org, then team, then user before the matched
+   rule. If a level denies, reject with 429 and release
+   reservations already taken for earlier levels in
+   that admission. After all three levels accept,
+   evaluate the matched rule. Inject headers from
+   exceeded soft tiers. A `deny` tier rejects with 429.
+   If `enforcement: hard` rejects the matched-rule
+   reservation, reject with 429 and release the [H1]
+   reservations from this admission. If `enforcement:
+   soft` forwards after that reservation is denied, do
+   not store a rule reservation. Rule reconciliation
+   and rule-reservation cleanup do not run. The [H1]
+   holds stay and are reconciled with the response.
+   If the request is lost, cleanup releases them.
+   Admission-time estimation is
+   required when [H1] is configured.
+   Response-only accounting, which admits a request
+   with no reservation, is available only when [H1]
+   is not configured.
 
 2. **Inference** - The request is forwarded upstream.
    The provider performs inference and returns token
@@ -473,8 +638,9 @@ Each request passes through four phases:
    logged for observability.
 
 4. **Cleanup** - If a request is lost (timeout,
-   connection reset, upstream failure), release the
-   reservation after a configurable hold period.
+   connection reset, upstream failure), release every
+   outstanding reservation, including accepted [H1]
+   holds, after a configurable hold period.
 
 #### Estimation Strategies
 
@@ -521,6 +687,12 @@ token count). If no fallback is configured, the
 request is admitted without reservation (same as
 omitting `estimation`). This prevents false denials
 on requests that legitimately omit `max_tokens`.
+When [H1] is configured, `reserved_tokens` alone is
+valid. A rule that sets `estimation` must set
+`fallback_estimate` greater than zero. Omitting both
+`reserved_tokens` and that fallback is rejected.
+The response-only paths above apply only when [H1]
+is absent.
 
 The fixed set of named strategies covers common
 patterns. Additional strategies can be added as
@@ -829,5 +1001,10 @@ configurations.
 
 [#155]: https://github.com/praxis-proxy/praxis/issues/155
 [#551]: https://github.com/praxis-proxy/praxis/issues/551
+[ai#123]: https://github.com/praxis-proxy/ai/issues/123
+[ai#125]: https://github.com/praxis-proxy/ai/issues/125
 [ai#126]: https://github.com/praxis-proxy/ai/issues/126
 [ai#1241]: https://github.com/praxis-proxy/ai/issues/1241
+[ai#129]: https://github.com/praxis-proxy/ai/issues/129
+[ai#979]: https://github.com/praxis-proxy/ai/issues/979
+[ai#980]: https://github.com/praxis-proxy/ai/pull/980
