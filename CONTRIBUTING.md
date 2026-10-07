@@ -1,78 +1,53 @@
-# Contributing Enhancements
+# Contributing
 
-Thank you for your interest in improving Praxis.
+Thank you for your interest in contributing! Start by
+reading the [development conventions]. Submissions that
+do not follow the conventions will be rejected.
 
-## How New Features Happen
+[development conventions]: docs/conventions.md
 
-```
-Issue -> Triage -> Accepted -> Work it
-```
+## Getting Started
 
-**Open an issue.** This is the entry point. Describe
-what you want and why. Your issue starts labeled
-`triage/needs-triage`.
+1. Fork the repository and clone your fork
+2. Install pre-commit hooks: `make setup-hooks`
+3. Build and test: `make build && make test`
+4. Run every gate locally before pushing: `make all`
 
-**Maintainers triage it.** They mark it either
-`triage/accepted` or `triage/declined`. If the
-change is big enough to need a written proposal
-first, they'll say so clearly with
-`triage/needs-proposal`.
+Requirements are listed in [docs/development.md].
 
-**Build it.** Once accepted, it's fair game to work
-on according to its project status and milestone.
+[docs/development.md]: docs/development.md
 
-> **Nothing here is guaranteed.** Acceptance does
-> not guarantee a feature ships, and a feature can
-> be changed, reworked, or removed at any stage.
+## Picking Up an Issue
 
-Small changes (bug fixes, minor enhancements,
-documentation updates) don't need any of this. Just
-open a PR.
+Only issues a maintainer has triaged (given a milestone
+and added to a project board) are open for contributors
+to take, and only at `Medium` or `Low` priority. Urgent
+and high-priority work is assigned by maintainers. If you
+self-assign something outside these rules, a bot unassigns
+it and points you back here. See [Picking Up Work] for the
+full policy.
 
-## When a Proposal Is Required
+[Picking Up Work]: docs/development.md#picking-up-work
 
-Most issues don't need a proposal. Maintainers ask
-for one (by adding `triage/needs-proposal`) when a
-change spans multiple PRs, introduces a new
-architectural pattern, affects a project's public
-interface, or is complex enough to warrant a
-written design.
+## Larger Changes
 
-When asked, create a file in `proposals/` using the
-[template]. The filename must follow the convention:
+Features that span multiple PRs, introduce new
+architectural patterns, or affect the public interface
+go through the [proposal process].
 
-```
-<5-digit-issue-number>_<kebab-case-slug>.md
-```
+[proposal process]: https://github.com/praxis-proxy/enhancements/blob/main/docs/process.md
 
-Start with **What?** and **Why?**; add **How?** in a
-follow-up PR once the direction is accepted. Iterate
-until a maintainer marks the proposal `accepted`.
+## Pull Request Gates
 
-At their discretion, maintainers may also ask that a
-feature be prototyped in the [experimental repo]
-first. See [experimental-phase.md] for details.
+CI enforces reviewability on every PR:
 
-## Proposal Requirements
+- A maximum added lines count of production code (tests, docs, examples excluded)
+- A real description of what and why - `Signed-off-by`
+  trailer on every commit (`git commit -s`)
+- Cryptographically signed commits (GPG or SSH)
+- Human authorship: commits authored or signed-off by tools are rejected
+- Conventional commit subjects (`type(scope): summary`, ≤72 chars)
 
-When a proposal is required, it must include:
+See the [PR conventions] section for details and override labels.
 
-- An `issue` link to the originating issue
-- At least one author
-- At least one stakeholder
-- A `repos` list of affected repositories
-- At least one graduation criterion
-
-See the [template] for the full frontmatter schema.
-
-## Affected Repositories
-
-Valid `repos` values:
-
-`praxis`, `ai`, `operator`, `extproc`,
-`conventions`, `experimental`, `grid`, `forge`,
-`policy`, `demos`, `pingora`
-
-[template]: proposals/template.md
-[experimental repo]: https://github.com/praxis-proxy/experimental
-[experimental-phase.md]: docs/experimental-phase.md
+[PR conventions]: docs/conventions.md#pull-request-conventions
