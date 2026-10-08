@@ -1195,6 +1195,20 @@ envelope encryption comes later, since it has to work
 with conditional writes and takes its keys from the
 secrets interface that is out of scope here.
 
+Object bodies are bounded too. `ObjectRead::body`
+outlives the `get` call, so the wrapper hands it back
+wrapped: every read from it is bounded by the backend
+`timeout` as an idle limit between chunks, and a read
+that exceeds it ends the body with an error, drops the
+backend connection, and records the operation as timed
+out. A `put` is held to the same bound in the other
+direction: a consumer that stops producing chunks for
+longer than `timeout` has its write aborted and cleaned
+up, so a stalled producer cannot hold a backend
+connection. Neither bound is a total transfer time; a
+multi-MiB object streams for as long as chunks keep
+arriving.
+
 For SQL the wrapper is `SqlHandle::run`. It applies the
 backend `timeout` to the whole operation, records
 latency and outcome under the operation name, and maps
