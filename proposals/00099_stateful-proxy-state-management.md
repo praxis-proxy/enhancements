@@ -970,12 +970,20 @@ clone over one shared map, so the same handle survives
 pub struct StateRegistry { /* Arc<inner> */ }
 
 impl StateRegistry {
-    pub fn kv(&self, name: &str)
-        -> Option<Arc<dyn KvStore>>;
+    /// Handles bound to one consumer namespace and one
+    /// trusted tenant. Only host code builds the
+    /// `Scope`; filters never see this signature.
+    pub fn kv(&self, name: &str, scope: Scope)
+        -> Option<KvHandle>;
     pub fn sql(&self, name: &str) -> Option<SqlHandle>;
-    pub fn object(&self, name: &str)
-        -> Option<Arc<dyn ObjectStore>>;
+    pub fn object(&self, name: &str, scope: Scope)
+        -> Option<ObjectHandle>;
 }
+
+/// `KvStore` minus the `scope` parameter, bound at
+/// lookup. `ObjectHandle` is the same for objects.
+#[derive(Clone, Debug)]
+pub struct KvHandle { /* Arc<dyn KvStore> + Scope + limits */ }
 
 /// A SQL backend behind the timeout and metrics
 /// wrapper; the only way to reach its pool.
@@ -994,11 +1002,24 @@ impl SqlHandle {
 }
 ```
 
-`sql` returns a `SqlHandle` rather than a bare trait
-object so every query, not only pool checkout, passes
-through the timeout and metrics wrapper. The `kv` and
-`object` handles are wrapped the same way inside the
-registry.
+Every accessor returns a handle, never the backend
+itself. `KvHandle` and `ObjectHandle` carry the `Scope`
+they were bound with, so their methods take no `scope`
+and a filter cannot name a tenant or namespace of its
+choosing. `HttpFilterContext` is what calls these
+accessors: it builds the `Scope` from the filter's
+configured name (or its chain's, or `global`) and from
+the request's trusted tenant identity, the same
+identity the typed domain layer already uses; in a
+deployment with no tenant identity the tenant is the
+configured default, never a request header. The policy
+engine's host adapter binds scope for plugins the same
+way. `SqlHandle` goes through the same wrapper for
+timeouts and metrics, with tenancy left to the domain
+schema as above. The `scope` parameter on the traits is
+the boundary between the wrapper and a backend,
+reachable from backend implementations and tests, not
+from filters.
 
 The difference is where backends come from.
 `KvStoreRegistry::get_or_create` hardcodes the in-memory
