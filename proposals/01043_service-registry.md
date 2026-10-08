@@ -6,15 +6,14 @@ repos:
 authors:
   - alexsnaps
 graduation_criteria:
-  - Service trait shape (health / stop) agreed by stakeholders
-  - Startup deadline scope (per-service vs. global default) agreed
-  - Degraded-state surface to filter callers decided (`ServiceHandle::health()` accessor, domain-method errors, or none)
-  - Downcast mechanism from `Arc<dyn ManagedService>` to `Arc<dyn DomainTrait>` agreed
-  - GC mechanism and timing decided (ref-count drop vs. scheduled sweep after reload)
-  - Relation to ENH-1042 (filter-task-supervisor) and ENH-099 (state management) documented
-  - `ServiceFactory` registration API agreed, including whether the bootstrap runtime outlives startup (service task runtime) or is torn down after all `create` calls finish
+  - `ManagedService` trait shape (health / stop) agreed by stakeholders
+  - `PipelineBuildContext` design agreed (unified replacement for `RegisteredFilterFactory` variants)
+  - Service factory registration integrated into `ServerComposition`
+  - Reload sequencing (service config change → filter chain rebuild) implemented and tested
+  - Storage backend (ENH-099) uses `Service` lifecycle as its connectivity layer
+  - Relation to ENH-1042 (background task runtime scope) documented
 experimental_exempt: true
-experimental_exempt_reason: "Core infrastructure — touches filter construction, pipeline build, and server bootstrap paths"
+experimental_exempt_reason: "Core infrastructure — touches filter construction, pipeline build, server bootstrap, and ServerComposition"
 related:
   - 01042
   - 00099
@@ -35,29 +34,29 @@ directly inside the filter struct means a hot-reload destroys
 and recreates it; using a global static means no lifecycle and
 no operator visibility.
 
-This proposal introduces a `Service` trait for long-lived,
+This proposal introduces a `ManagedService` trait for long-lived,
 shared resources and a `ServiceRegistry` that manages their
 lifecycle independently from any individual filter chain.
 
-A `Service`:
+A service:
 
-- Is declared by name in a top-level `services:` config
-  section, constructed once at server start, and not
-  recreated on pipeline hot-reload.
-- Survives filter-chain hot-reload as long as at least one
-  active pipeline still holds a handle to it.
-- Starts up inside `ServiceFactory::create`. The registry runs
-  all `create` calls on a dedicated bootstrap runtime it owns
-  (a private OS thread + `current_thread` Tokio runtime), so
-  service authors can write async startup without managing their
-  own runtime. The registry applies a configurable deadline;
-  timeout or error is fatal. Filters never see a service that
-  hasn't finished starting.
+- Is declared by name in a top-level `services:` config section,
+  constructed once at server start and not recreated on
+  filter-chain hot-reload.
+- Survives filter-chain hot-reload as long as it remains in
+  the `services:` config section unchanged.
+- Starts up inside `ServiceFactory::create`, which is async.
+  The registry runs all `create` calls on a dedicated bootstrap
+  runtime (private OS thread + `current_thread` Tokio runtime)
+  it owns and keeps alive. A configurable deadline applies per
+  service; timeout or error is fatal. Filters never see a service
+  that has not finished starting.
 - Can enter a `Degraded` state after startup — the natural
-  encapsulation point for a circuit breaker or a partial
-  backend failure.
-- Is stopped and its resources released when no active filter
-  holds a handle to it (garbage collection).
+  encapsulation point for a circuit breaker or a partial backend
+  failure.
+- Is stopped when its config changes on reload (see reload
+  semantics below) or when it is removed from the `services:`
+  section and no active pipeline holds a handle to it.
 
 The `ServiceRegistry` maps service names to live instances,
 tracks which filter pipelines reference each, and drives the
@@ -65,37 +64,42 @@ start / stop lifecycle.
 
 ### Goals
 
-- Provide a `Service` trait with a synchronous `health` query
-  (`Ready` / `Degraded`) and an async `stop`.
-- Provide a `ServiceRegistry` that is fully initialized from a
-  top-level `services:` config section before any pipeline is
-  built; each named service is started once and survives
-  hot-reload as long as it remains in config.
-- Expose `ServiceRegistry::get(name)` as the only filter-facing
-  API: synchronous, no factory argument, no async — the registry
-  is already running by the time any filter is constructed.
-- Let a filter hold a `ServiceHandle<S>` so a hot reload does
-  not destroy a running connection pool or break a circuit-breaker
-  state machine that spans many requests.
-- Enable circuit-breaker logic to live inside a `Service`
+- Provide a `ManagedService` trait with synchronous `health`
+  (`Ready` / `Degraded`) and async `stop`, used exclusively by
+  the registry. Filter code never interacts with `ManagedService`
+  directly.
+- Provide a `ServiceRegistry` fully initialized from the
+  `services:` config section before any pipeline is built; expose
+  `ServiceRegistry::get::<ConcreteType>(name)` as the only
+  filter-facing API — synchronous, no factory, no async.
+- Give storage backends (ENH-099) the startup, health, and GC
+  lifecycle they need; this is one of the primary motivations.
+- Let a filter hold a `ServiceHandle<T>` so a hot-reload that
+  does not change the `services:` section does not destroy a
+  running connection pool or reset a circuit-breaker state
+  machine.
+- Enable circuit-breaker logic to live inside a service
   implementation rather than inside a per-request filter, so
   the breaker accumulates history across requests and reloads.
 - Give the admin surface enough information to report which
   services are running and whether they are `Ready` or `Degraded`.
+- Extend `ServerComposition` and replace the accumulating
+  `RegisteredFilterFactory` variants with a unified
+  `PipelineBuildContext` that carries `FilterRegistry`,
+  `ServiceRegistry`, and future build-time dependencies.
 
 ### Non-Goals
 
 - Replacing filter-task-supervisor (ENH-1042). A service may
-  use pipeline-task infrastructure internally; that is
-  composition. Services outlive individual pipelines.
+  use the dedicated background runtime internally; that is
+  composition, not replacement.
 - Replacing Pingora `BackgroundService` or `server.add_service`.
   Those are process-lifetime listeners and admin endpoints.
-- Defining the storage backend API. ENH-099 explicitly reserved
-  alignment with "the shared service definition once it lands";
-  that reservation is this proposal. ENH-099 owns the storage
-  abstraction; this proposal owns the lifecycle layer beneath it.
-- Specifying any concrete connection pool or HTTP client
-  implementation.
+- Defining the storage backend API. ENH-099 owns that; this
+  proposal owns the lifecycle layer beneath it.
+- Shipping any concrete service implementation (connection pool,
+  HTTP client, etc.). Core provides the infrastructure; extension
+  crates provide implementations.
 - Multi-tenant isolation or per-route service scoping.
 
 ## Why?
@@ -119,37 +123,43 @@ removed from every pipeline.
 
 Neither option supports a startup phase. A filter that must
 run a schema migration or warm a local cache before serving
-traffic has nowhere to block pipeline readiness on completion.
+traffic has nowhere to block pipeline readiness until that
+work completes.
 
 Neither option supports a shared circuit breaker. A filter that
 wraps an unreliable external call must reinvent open/half-open/
 closed state per filter instance, losing all accumulated history
 on every reload.
 
-Neither option gives the operator visibility. There is no way
-to ask "which external services is this proxy currently holding
-connections to?" or "is the token-validation service degraded?"
+Neither option gives the operator visibility into what external
+connections the proxy is holding, or whether any of them are
+impaired.
 
-The state-management proposal (ENH-099) explicitly deferred
-`Backend connectivity fields aligned with the shared service
-definition once it lands`. This is that definition.
+Storage backends are the canonical first consumer. ENH-099
+explicitly deferred *"Backend connectivity fields aligned with
+the shared service definition once it lands"*; this is that
+definition. A Postgres-backed `SqlStore` that runs schema
+migrations before the proxy accepts traffic, and surfaces a
+`Degraded` signal when the database is unreachable, is exactly
+the use case this proposal targets.
 
 ### User Stories
 
 - As a filter author building a database-backed rate limiter,
-  I want a shared connection pool that survives hot-reload so
-  that a config change does not flush open connections.
+  I want a shared connection pool that survives filter-chain
+  hot-reload so that a config change does not flush open
+  connections.
 - As a filter author, I want to run schema migrations inside
   `ServiceFactory::create` and have the registry refuse to
   build pipelines until they complete, so the filter is never
   live against a stale schema.
 - As a filter author, I want to encapsulate a circuit breaker
-  inside my `Service` so that the filter can query health on
-  the hot path without managing open/half-open/closed state
-  itself.
+  inside my service so the breaker accumulates state across
+  requests and reloads without each filter instance reinventing
+  open/half-open/closed tracking.
 - As an operator, I want the admin endpoint to report which
   services are running and whether they are `Ready` or
-  `Degraded`, without needing to dig into filter-level metrics.
+  `Degraded`, without needing to inspect filter-level metrics.
 - As a platform engineer doing a hot reload, I want services
   that are no longer referenced by any pipeline to be stopped
   and their resources released without a process restart.
@@ -158,283 +168,347 @@ definition once it lands`. This is that definition.
 
 > **Note:** this is a **lightweight sketch** to anchor
 > stakeholder discussion. Shapes are illustrative, not final.
-> Open questions are listed at the end.
 
 ### Experimental Phase
 
 `experimental_exempt` — this touches filter construction,
-pipeline build, and the server bootstrap path, which are not
-representable in the experimental repo without significant
-forking.
+pipeline build, `ServerComposition`, and the server bootstrap
+path, which are not representable in the experimental repo
+without significant forking.
 
 ### Design Sketch
 
-#### Two traits: lifecycle vs. domain interface
+#### Two-trait split: `ManagedService` vs. domain interface
 
-The design splits the service API across two distinct boundaries:
+The design separates two concerns:
 
 - **`ManagedService`** — the registry-internal lifecycle trait.
-  Only the registry calls these methods. Filter code never sees it.
-- **The domain interface** — a user-defined trait (e.g. `trait Pool`,
-  `trait TokenCache`) that the concrete service type implements.
-  This is what the filter holds and calls through its handle.
+  Only the registry calls `health()` and `stop()`. Filter code
+  never holds `dyn ManagedService`.
+- **The concrete service type** — what the filter receives via
+  `ServiceHandle<T>`. The type implements both `ManagedService`
+  (for the registry) and its own domain methods (for filters).
+  The registry holds `Arc<dyn ManagedService>`; the handle holds
+  `Arc<T>` obtained by downcasting `Arc<dyn Any + Send + Sync>`.
+
+> [!IMPORTANT]
+> Since `ServiceHandle<T>` derefs to `T`, and `T` implements
+> `ManagedService`, lifecycle methods are technically reachable
+> through the handle. Enforcement is by convention and
+> documentation, not the type system. A future extension could
+> use trait-object coercions (`Arc<dyn Pool>`) to eliminate this
+> gap, but requires the factory to register coercions upfront and
+> adds significant complexity; it is noted here as a future option
+> (see Open Question 3).
 
 ```rust
 use std::borrow::Cow;
 use async_trait::async_trait;
 
 pub enum ServiceHealth {
-    /// Service is healthy.
     Ready,
-    /// Service is available but impaired (e.g. circuit half-open).
     Degraded { reason: Cow<'static, str> },
 }
 
 pub type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Registry-internal lifecycle trait.
-///
-/// Filter code never holds a reference to `dyn ManagedService`.
-/// The registry uses this to monitor health and drive shutdown.
+/// Registry-internal lifecycle trait. Filter code never holds
+/// a reference to `dyn ManagedService`.
 #[async_trait]
 pub trait ManagedService: Send + Sync + 'static {
-    /// Unique type name (e.g. `"pg_pool"`). Used for admin surfaces.
     fn service_type(&self) -> &'static str;
 
     /// Current health. Called by the registry for admin/observability.
     /// Must not block.
     fn health(&self) -> ServiceHealth;
 
-    /// Release resources. Called when the last handle is dropped and
-    /// GC runs. Filter code cannot trigger this.
+    /// Release resources. Called by the registry at GC time.
     async fn stop(&self);
 }
 ```
 
-The concrete service type implements both `ManagedService`
-(for the registry) and the user-defined domain trait (for
-filters). The registry stores `Arc<dyn ManagedService>` for
-lifecycle operations; `ServiceHandle<S>` holds only the domain
-type `S` — `stop()`, `service_type()`, and `health()` are not
-reachable through it.
-
-#### `ServiceHandle<S>`
-
-`S` is constrained to the service's domain interface — a
-user-defined trait that contains no lifecycle methods. The
-handle `Deref`s to `S`; nothing on the deref path touches
-`ManagedService`.
+#### `ServiceHandle<T>`
 
 ```rust
 use std::{ops::Deref, sync::Arc};
 
-/// A filter-held reference to a running service's domain interface.
+/// A filter-held reference to a running service.
 ///
-/// `S` is the concrete service type or a domain trait (e.g.
-/// `dyn Pool`). It does not include `ManagedService` methods.
-/// Cloning shares the reference; the registry's GC token is
-/// internal and not accessible to the holder.
-pub struct ServiceHandle<S: ?Sized> {
-    inner: Arc<S>,
-    // Internal GC token — invisible to the filter.
+/// `T` is the concrete service type. `stop()`, `health()`, and
+/// `service_type()` come from `ManagedService`, which `T` also
+/// implements — but filter code should not call lifecycle methods
+/// through this handle.
+pub struct ServiceHandle<T> {
+    inner: Arc<T>,
+    // Internal GC token (atomic ref-count in the registry entry).
+    // Not accessible to the holder.
 }
 
-impl<S: ?Sized> Clone for ServiceHandle<S> { /* Arc::clone on inner */ }
-impl<S: ?Sized> Deref for ServiceHandle<S> {
-    type Target = S;
-    fn deref(&self) -> &S { &self.inner }
+impl<T> Clone for ServiceHandle<T> { /* Arc::clone on inner */ }
+impl<T> Deref for ServiceHandle<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.inner }
 }
 ```
 
 #### `ServiceFactory` and registry bootstrap
 
-Services are declared in a top-level `services:` config section.
-Each named entry names a service type; the registry resolves the
-type to a registered factory, calls it with the entry's config,
-and starts the resulting service before any pipeline is built.
-
 ```rust
 /// Constructs and starts a service instance from YAML config.
 ///
-/// `create` is async so implementations can open connections, run
-/// migrations, and retry internally without managing their own Tokio
-/// runtime. The registry runs all `create` calls on a dedicated
-/// bootstrap runtime it owns (OS thread + `current_thread` Tokio
-/// runtime, mirroring the `spawn_on_dedicated_runtime` pattern
-/// already used in the praxis server for health checks and
-/// housekeeping). The registry wraps each call in
-/// `tokio::time::timeout` from the per-service (or global)
-/// `startup_deadline`; error or timeout is fatal.
+/// `create` is async; the registry runs it on a dedicated bootstrap
+/// runtime (OS thread + `current_thread` Tokio runtime, mirroring
+/// `spawn_on_dedicated_runtime` already used for health checks and
+/// housekeeping). That runtime is kept alive after bootstrap to serve
+/// as the task runtime for service background loops (health-check
+/// ticks, circuit-breaker maintenance). The registry wraps each call
+/// in `tokio::time::timeout` using the per-service `startup_deadline`
+/// or the global default; error or timeout is fatal.
 ///
 /// There is no Tokio runtime in scope when the praxis server calls
 /// `ServiceRegistry::build` — the Pingora runtime only starts after
-/// all pipelines are built. Service authors must not assume an ambient
-/// runtime; the registry provides one exclusively for `create`.
-///
-/// `Service` must implement `ManagedService` (for the registry) and
-/// whatever domain trait filters will hold through `ServiceHandle`.
+/// all pipelines are built.
 #[async_trait]
 pub trait ServiceFactory: Send + Sync + 'static {
     type Service: ManagedService;
     async fn create(&self, config: &serde_yaml::Value) -> Result<Self::Service, ServiceError>;
 }
 
-/// Registry of running services. One instance per server.
 pub struct ServiceRegistry { /* opaque */ }
 
 impl ServiceRegistry {
-    /// Build the registry from the `services:` config section.
+    /// Build from the `services:` config section.
     ///
-    /// Spawns a dedicated OS thread with a `current_thread` Tokio
-    /// runtime, runs each factory's `create` under the configured
-    /// deadline, then joins the thread. Returns `Err` if any service
-    /// fails to construct or times out.
+    /// Spawns the dedicated bootstrap/task runtime, runs each factory's
+    /// `create` under the configured deadline, then returns. Returns
+    /// `Err` if any service fails to construct or times out.
     ///
-    /// Called once during server bootstrap (or on reload when the
-    /// services section changes), before any pipeline is built and
-    /// before the Pingora runtime starts.
+    /// Called before any pipeline is built and before the Pingora
+    /// runtime starts.
     pub fn build(
         factories: &ServiceFactoryRegistry,
         config: &serde_yaml::Value,
     ) -> Result<Self, ServiceError>;
 
-    /// Look up a running service's domain interface by name.
+    /// Look up a running service by name, downcasting to `T`.
     ///
-    /// `S` is the domain type (concrete or trait object) — it must
-    /// not be `ManagedService`. Returns `Err` if the name is unknown
-    /// or the stored concrete type cannot be downcast to `S`.
-    /// Synchronous; the registry is fully started before any filter
-    /// is constructed.
-    ///
-    /// How the registry maps from `Arc<dyn ManagedService>` to
-    /// `Arc<S>` is TBD (see open questions).
-    pub fn get<S: 'static>(&self, name: &str) -> Result<ServiceHandle<S>, ServiceError>;
+    /// Synchronous. The registry is fully started before any filter
+    /// is constructed. Returns `Err` if the name is unknown or the
+    /// stored type is not `T`.
+    pub fn get<T: ManagedService>(&self, name: &str) -> Result<ServiceHandle<T>, ServiceError>;
 
-    /// Snapshot of {service name → filter/pipeline IDs holding a handle}.
+    /// Snapshot of {service name → filter/pipeline IDs with live handles}.
     pub fn usage_snapshot(&self) -> HashMap<String, Vec<String>>;
 
     /// Stop and remove services with no live handles.
     ///
-    /// Returns the names of services that were stopped.
-    /// Called after a reload drops old pipelines.
-    pub async fn gc(&self) -> Vec<String>;
+    /// Called explicitly by the server after old pipelines are dropped
+    /// at the end of a reload. Never triggered automatically by handle
+    /// drop — see ADR-1.
+    pub fn gc(&self) -> Vec<String>; // sync: stop() is async internally
 }
 ```
 
 #### Filter-side sketch
 
 ```rust
-// The domain trait the filter cares about — no lifecycle methods.
-trait Pool: Send + Sync {
-    async fn acquire(&self) -> Result<PooledConnection, PoolError>;
+// The concrete type implements both lifecycle (for the registry)
+// and domain logic (for filters).
+struct PgPool { /* ... */ }
+
+impl ManagedService for PgPool {
+    fn service_type(&self) -> &'static str { "pg_pool" }
+    fn health(&self) -> ServiceHealth { /* read internal circuit state */ }
+    async fn stop(&self) { /* close connections */ }
 }
 
-// The concrete type implements both the registry lifecycle and the
-// filter-visible domain trait.
-struct PgPool { /* ... */ }
-impl ManagedService for PgPool { /* service_type, health, stop */ }
-impl Pool for PgPool { /* acquire */ }
+impl PgPool {
+    pub async fn acquire(&self) -> Result<PooledConnection, PoolError> { /* ... */ }
+}
 
-// The filter holds only the domain handle.
+// The filter holds ServiceHandle<PgPool>. It calls domain methods only.
 struct DbRateLimitFilter {
-    pool: ServiceHandle<dyn Pool>,
+    pool: ServiceHandle<PgPool>,
 }
 
 impl DbRateLimitFilter {
+    // from_config receives the registry via PipelineBuildContext.
     fn from_config(
         config: &serde_yaml::Value,
-        registry: &ServiceRegistry,
+        ctx: &PipelineBuildContext<'_>,
     ) -> Result<Self, FilterError> {
-        // get::<dyn Pool> — no lifecycle methods visible through this handle.
-        let pool = registry.get::<dyn Pool>("pg_pool:main")?;
+        let pool = ctx.services().get::<PgPool>("pg_pool:main")?;
         Ok(Self { pool })
     }
 }
 
-// On the hot path the filter calls domain methods only.
-// It cannot call stop(), service_type(), or health() through the handle.
+// Hot path: domain call only.
 let conn = self.pool.acquire().await?;
+
+// Checking health (accessible but conventionally registry-only):
+// self.pool.health() — callable but filter authors should not use it.
 ```
 
 #### Config sketch
 
 ```yaml
 services:
-  pg_pool:main:
-    type: pg_pool
-    startup_deadline: 30s   # optional; falls back to a global default
-    host: db.internal
-    port: 5432
-    max_connections: 50
+  startup_deadline: 30s        # global per-service default
+  instances:
+    pg_pool:main:
+      type: pg_pool
+      startup_deadline: 60s    # per-service override (slow migration)
+      host: db.internal
+      port: 5432
+      max_connections: 50
 
 filters:
   - filter: db_rate_limit
     service: pg_pool:main
 ```
 
+#### Reload semantics
+
+A service survives reload if and only if its entry in `services:`
+is unchanged. When the `services:` section changes:
+
+- **Entry unchanged**: service keeps running; new filter instances
+  receive handles to the same `Arc<T>`.
+- **Entry config changed**: the service is stopped and restarted.
+  All filter chains that reference it are also rebuilt (they
+  receive handles to the new instance). Old service is GC'd after
+  old pipelines drop.
+- **Entry removed**: service is GC'd after the last referencing
+  pipeline drops its handles (via explicit `gc()` after reload).
+- **Entry added**: service is constructed and started before
+  pipelines that reference it are built.
+
+Filter authors can assume the service's config is stable for the
+lifetime of their handle.
+
+#### `ServerComposition` and `PipelineBuildContext`
+
+Service factory registration is part of `ServerComposition`,
+parallel to filter factory registration:
+
+```rust
+ServerComposition::new()
+    .with_filter_registry(filter_registry)
+    .with_service_factories(service_factory_registry)
+```
+
+The proliferating `RegisteredFilterFactory` variants (`Standard`,
+`HttpWithRegistry`, `ChainBinding`, `Policy`, …) are replaced by
+a single `PipelineBuildContext` passed to all context-aware
+factories:
+
+```rust
+// One registration path for context-aware filters (replaces all variants):
+registry.register_with_context("my_filter", |config, ctx| {
+    let pool = ctx.services().get::<PgPool>("pg_pool:main")?;
+    Ok(Box::new(MyFilter { pool }))
+});
+```
+
+`PipelineBuildContext` carries `FilterRegistry`, `ServiceRegistry`,
+and future build-time dependencies, so adding a new dependency
+does not add a new registration variant.
+
+### Architecture Decision Record
+
+> These decisions were reached in initial stakeholder review.
+> They **can be revisited** before the graduation criteria are met.
+
+1. **Explicit GC.** `gc()` is called explicitly by the server
+   after old pipelines are dropped, not triggered by
+   `ServiceHandle` drop. Arc counts can transiently hit zero
+   during the window between old-pipeline drop and new-pipeline
+   acquisition, making automatic GC unsafe.
+
+2. **Bootstrap runtime kept alive.** The dedicated OS thread +
+   `current_thread` Tokio runtime used for `create` calls is
+   retained as the service task runtime for the registry's
+   lifetime. Services can `tokio::spawn` background loops inside
+   `create`; the registry cancels per-service tokens and calls
+   `stop()` at GC time.
+
+   > [!IMPORTANT]
+   > A single dedicated thread is accepted for now; flagged for
+   > potential revisit if contention or scheduling latency becomes
+   > a concern.
+
+3. **Concrete type for `get()`.** `registry.get::<PgPool>(name)`
+   downcasts via `Arc<dyn Any + Send + Sync>`. Lifecycle method
+   accessibility through `Deref` is accepted; enforcement is by
+   convention.
+
+   > [!IMPORTANT]
+   > A future extension using trait-object coercions (`Arc<dyn Pool>`)
+   > would enforce the boundary in the type system but requires
+   > factories to register coercions upfront (see Open Question 3).
+
+4. **`health()` accessible via handle.** Since `ServiceHandle<T>`
+   derefs to `T` and `T: ManagedService`, `handle.health()` is
+   callable from filter code. This is treated as acceptable for
+   the circuit-breaker use case and not restricted.
+
+5. **Startup deadline: global default + per-service override.**
+   A global `startup_deadline` under `services:` sets the default
+   for all services; per-instance entries can override.
+
+   > [!IMPORTANT]
+   > A total bootstrap deadline (hard cap on the entire `build()`
+   > call across all services) is deferred from this proposal
+   > (see Open Question 2).
+
+6. **Per-server-instance registry.** `ServiceRegistry` is owned
+   by `ServerState`, parallel to `FilterRegistry`. One per
+   `try_run_server_with_composition` call; extproc embeddings get
+   their own naturally.
+
+7. **Service config change triggers filter chain rebuild.** If a
+   service's config changes on reload, the service is stopped and
+   restarted, and all filter chains that reference it are rebuilt.
+   Filter authors can assume a stable service config for the
+   lifetime of their handle.
+
+8. **Storage backends are a primary motivation.** A `KvStore` or
+   `SqlStore` backend (ENH-099) is a `Service`: startup runs
+   migrations, `health()` surfaces database reachability, GC
+   releases the pool when no filter needs it. ENH-099's backend
+   connectivity fields must use this lifecycle layer.
+
+9. **Unified `PipelineBuildContext`.** Replaces the accumulating
+   `RegisteredFilterFactory` variants. All build-time dependencies
+   (`FilterRegistry`, `ServiceRegistry`, future additions) are
+   carried through a single context, with one "simple" and one
+   "context-aware" filter registration path.
+
+10. **Service factory registration via `ServerComposition`.** Core
+    ships no concrete service types. Extension crates (e.g.
+    praxis-ai) register their factories through the same
+    composition API used for custom filters.
+
 ### Open Questions
 
-1. **Startup deadline scope.** Should `startup_deadline` be
-   per-service (in each entry's config, as sketched), a single
-   global default, or both (per-service overrides a global
-   default)? A global default avoids repeating the same timeout
-   on every entry; per-service overrides are useful when one
-   service (e.g. a slow migration) legitimately needs more time.
+> [!IMPORTANT]
+> **Background task runtime scope (relation to ENH-1042).** The
+> registry's dedicated runtime is kept alive for service background
+> loops. ENH-1042's pipeline task supervisor is a separate,
+> shorter-lived scope (pipeline lifetime). How do they compose when
+> a service also wants to participate in pipeline events? This needs
+> to be documented before ENH-1042 and this proposal are both
+> implemented.
 
-2. **Degraded-state surface.** `health()` is on `ManagedService`
-   (registry-only). A filter that wants to fail-closed when its
-   service degrades needs an alternative. See open question 5.
+> [!IMPORTANT]
+> **Total bootstrap deadline (deferred).** A hard cap on the entire
+> `ServiceRegistry::build()` call (across all services) is out of
+> scope for this proposal but is a natural follow-on — particularly
+> useful for Kubernetes startup probes.
 
-3. **Registry scope.** Is the registry a process-level singleton
-   or per-server-instance? The extproc embedding model builds a
-   Praxis filter pipeline inside a host process; it may need its
-   own registry or may share the embedding server's. Also: does
-   a service registered in `praxis-core` know which server scope
-   it belongs to?
-
-4. **Downcast mechanism.** The registry stores `Arc<dyn ManagedService>`.
-   `get::<dyn Pool>(name)` must obtain `Arc<dyn Pool>` from it.
-   Rust has no built-in `Arc<dyn A>` → `Arc<dyn B>` coercion even
-   when the concrete type implements both. Options:
-   - `ManagedService` requires `fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>`
-     and the registry double-stores the erased `Arc` for downcast.
-   - The factory registers both the `Arc<dyn ManagedService>` and
-     a type-erased `Arc<dyn Any>` at construction time.
-   - `get` is keyed on both name and `TypeId`; the factory registers
-     multiple typed `Arc`s at construction.
-   Whichever approach is chosen, a type mismatch at `get` call time
-   is a config error that should be caught at pipeline build, not at
-   request time.
-
-5. **`health()` visibility to filters.** Currently `health()` is on
-   `ManagedService` (registry-only). A filter that wants to fail-closed
-   when its service is `Degraded` has no standard way to check health.
-   Options: expose `health()` as a method on `ServiceHandle<S>`
-   directly (independent of `S`); require service authors to include a
-   health query on their domain trait; or leave it to the service's
-   domain methods to return degraded errors inline.
-
-6. **Relation to filter-task-supervisor (ENH-1042).** A service
-   that drives a background health-check loop needs a Tokio task
-   that outlives any individual pipeline. The bootstrap runtime
-   is torn down after all `create` calls finish, so long-running
-   tasks started there would die with it. Does the registry keep
-   the bootstrap runtime alive as the service's task runtime for
-   its lifetime, or does the service spawn its own thread + runtime
-   inside `create` for its background loops? The answer affects
-   shutdown ordering and whether services share or own their
-   runtime.
-
-7. **GC timing.** GC is triggered after a reload drops old
-   pipelines. Is it the server's responsibility to call
-   `registry.gc()` explicitly, or does the registry detect
-   handle counts reaching zero and stop services automatically?
-   Automatic GC on zero-handles risks stopping a service during
-   a rolling reload that is about to re-reference it.
-
-8. **Storage backend alignment (ENH-099).** Should a `KvStore`
-   or `SqlStore` backend be registered as a `Service`? ENH-099
-   reserved a hook for this. If yes, storage backends gain the
-   same startup, health, and GC lifecycle as other services —
-   at the cost of requiring a `services:` entry for every
-   storage backend.
+> [!IMPORTANT]
+> **Trait-object coercion (future).** `ServiceHandle<dyn Pool>`
+> would prevent filter code from reaching lifecycle methods through
+> `Deref`, at the cost of requiring the factory to register
+> coercions at construction time. Left as a future option if the
+> convention-based boundary proves insufficient.
