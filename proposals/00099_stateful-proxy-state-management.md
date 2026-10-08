@@ -1160,8 +1160,10 @@ credential, so a plaintext `valkey://` URL with a
 `credential`, or a PostgreSQL `sslmode` below
 `verify-full`, is rejected at startup. The only way
 around it is an explicit `insecure_transport: true` on
-that backend, meant for loopback development endpoints
-and logged at startup every time it is set.
+that backend, accepted only when the endpoint is a
+loopback address or a unix socket: startup validation
+rejects it for any other endpoint, and logs it every
+time it is set.
 
 Deployment topology is the backend's business too. A
 Valkey entry declares standalone, Sentinel, or Cluster
