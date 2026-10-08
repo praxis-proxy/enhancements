@@ -1018,6 +1018,22 @@ get their own clone on a dedicated runtime, the same as
 health checks. Filters look up a backend by name at
 request time; they never build one.
 
+External backends register the way custom filters do.
+An embedding binary adds a factory to the registry
+builder before startup, keyed by a kind name, mirroring
+`FilterRegistry::register` and the `register_filters!`
+macro: `StateRegistry::builder().register_kv("my-kv",
+factory)`, and `register_object` likewise. There is no
+`register_sql`, since SQL backends are a closed set.
+The `kind` enum of each family carries a `custom`
+variant holding that name, and config validation at
+startup accepts only built-in kinds and registered
+names, failing otherwise with the list of both. The
+factory receives the backend's config entry and returns
+the trait object; the wrapper, limits, timeout, and
+metrics apply to it exactly as to a built-in backend,
+so an external backend cannot skip the contract.
+
 #### Configuration
 
 ```yaml
