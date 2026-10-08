@@ -1,5 +1,5 @@
 ---
-issue: # TBD – file in praxis repo and update
+issue: https://github.com/praxis-proxy/praxis/issues/1375
 status: proposed
 repos:
   - praxis
@@ -143,6 +143,9 @@ migrations before the proxy accepts traffic, and surfaces a
 `Degraded` signal when the database is unreachable, is exactly
 the use case this proposal targets.
 
+> [!NOTE]
+> See Architecture Decision Record 8.
+
 ### User Stories
 
 - As a filter author building a database-backed rate limiter,
@@ -227,6 +230,9 @@ pub trait ManagedService: Send + Sync + 'static {
 }
 ```
 
+> [!NOTE]
+> See Architecture Decision Record 3 and 4.
+
 #### `ServiceHandle<T>`
 
 ```rust
@@ -250,6 +256,9 @@ impl<T> Deref for ServiceHandle<T> {
     fn deref(&self) -> &T { &self.inner }
 }
 ```
+
+> [!NOTE]
+> See Architecture Decision Record 3 and 4.
 
 #### `ServiceFactory` and registry bootstrap
 
@@ -309,6 +318,9 @@ impl ServiceRegistry {
 }
 ```
 
+> [!NOTE]
+> See Architecture Decision Record 1 (explicit GC), 2 (bootstrap runtime), 3 (concrete-type `get`), and 5 (startup deadline).
+
 #### Filter-side sketch
 
 ```rust
@@ -349,6 +361,9 @@ let conn = self.pool.acquire().await?;
 // self.pool.health() — callable but filter authors should not use it.
 ```
 
+> [!NOTE]
+> See Architecture Decision Record 3 (concrete-type get), 4 (health accessibility), and 9 (PipelineBuildContext).
+
 #### Config sketch
 
 ```yaml
@@ -366,6 +381,9 @@ filters:
   - filter: db_rate_limit
     service: pg_pool:main
 ```
+
+> [!NOTE]
+> See Architecture Decision Record 5 (startup deadline).
 
 #### Reload semantics
 
@@ -385,6 +403,9 @@ is unchanged. When the `services:` section changes:
 
 Filter authors can assume the service's config is stable for the
 lifetime of their handle.
+
+> [!NOTE]
+> See Architecture Decision Record 1 (explicit GC) and 7 (service config change triggers filter chain rebuild).
 
 #### `ServerComposition` and `PipelineBuildContext`
 
@@ -413,6 +434,9 @@ registry.register_with_context("my_filter", |config, ctx| {
 `PipelineBuildContext` carries `FilterRegistry`, `ServiceRegistry`,
 and future build-time dependencies, so adding a new dependency
 does not add a new registration variant.
+
+> [!NOTE]
+> See Architecture Decision Record 9 (unified PipelineBuildContext) and 10 (service factory registration via ServerComposition).
 
 ### Architecture Decision Record
 
