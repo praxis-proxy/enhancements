@@ -1153,6 +1153,16 @@ and upstream clusters share one definition of TLS and
 auth. This proposal does not define that service model
 and does not block on it.
 
+Until then one requirement stands on its own: a
+credentialed external backend authenticates its
+endpoint and encrypts the transport before it sends a
+credential, so a plaintext `valkey://` URL with a
+`credential`, or a PostgreSQL `sslmode` below
+`verify-full`, is rejected at startup. The only way
+around it is an explicit `insecure_transport: true` on
+that backend, meant for loopback development endpoints
+and logged at startup every time it is set.
+
 Deployment topology is the backend's business too. A
 Valkey entry declares standalone, Sentinel, or Cluster
 mode in its `topology` field, and the backend handles
