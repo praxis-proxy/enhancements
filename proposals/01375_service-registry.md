@@ -18,6 +18,7 @@ related:
   - 01042
   - 00099
 stakeholders:
+  - aslakknutsen
   - shaneutt
   - leseb
   - rikatz
@@ -194,18 +195,14 @@ The design separates two concerns:
   The registry holds `Arc<dyn ManagedService>`; the handle holds
   `Arc<T>` obtained by downcasting `Arc<dyn Any + Send + Sync>`.
 
-> [!IMPORTANT]
-> Since `ServiceHandle<T>` derefs to `T`, and `T` implements
-> `ManagedService`, lifecycle methods are technically reachable
-> through the handle. Enforcement is by convention and
-> documentation, not the type system. A future extension could
-> use trait-object coercions (`Arc<dyn Pool>`) to eliminate this
-> gap, but requires the factory to register coercions upfront and
-> adds significant complexity; it is noted here as a future option
-> (see Open Question 3).
+> [!NOTE]
+> `stop()` is not forwarded as an inherent method on `ServiceHandle<T>`,
+> so filter code cannot call it without explicitly importing
+> `ManagedService`. `health()` is forwarded as an inherent method and is
+> intentionally accessible. See ADR-4 for the enforcement mechanism.
 
 ```rust
-use std::borrow::Cow;
+use std::{any::Any, borrow::Cow};
 use async_trait::async_trait;
 
 pub enum ServiceHealth {
@@ -217,11 +214,15 @@ pub type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Registry-internal lifecycle trait. Filter code never holds
 /// a reference to `dyn ManagedService`.
+///
+/// The `Any` supertrait is required so the registry can downcast its
+/// `Arc<dyn Any + Send + Sync>` back to `Arc<T>` in `ServiceRegistry::get`.
 #[async_trait]
-pub trait ManagedService: Send + Sync + 'static {
+pub trait ManagedService: Any + Send + Sync + 'static {
     fn service_type(&self) -> &'static str;
 
-    /// Current health. Called by the registry for admin/observability.
+    /// Current health. Called by the registry for admin/observability,
+    /// and forwarded to filter code via `ServiceHandle::health()`.
     /// Must not block.
     fn health(&self) -> ServiceHealth;
 
@@ -240,18 +241,35 @@ use std::{ops::Deref, sync::Arc};
 
 /// A filter-held reference to a running service.
 ///
-/// `T` is the concrete service type. `stop()`, `health()`, and
-/// `service_type()` come from `ManagedService`, which `T` also
-/// implements — but filter code should not call lifecycle methods
-/// through this handle.
-pub struct ServiceHandle<T> {
+/// `T: ManagedService` is required by the struct, but callers of
+/// `ServiceRegistry::get` need not import `ManagedService` to satisfy
+/// this bound — the compiler verifies it from the impl, not from the
+/// caller's imports.
+///
+/// `health()` is an inherent method on the handle and is intentionally
+/// accessible from filter code for circuit-breaker decisions. `stop()` is
+/// not forwarded as an inherent method; filter code that calls `pool.stop()`
+/// gets a compile error ("method not found — consider importing
+/// `ManagedService`") without an explicit import of the trait. This is a
+/// structural guarantee from module visibility combined with Rust's method
+/// resolution rules, not convention.
+pub struct ServiceHandle<T: ManagedService> {
     inner: Arc<T>,
     // Internal GC token (atomic ref-count in the registry entry).
     // Not accessible to the holder.
 }
 
-impl<T> Clone for ServiceHandle<T> { /* Arc::clone on inner */ }
-impl<T> Deref for ServiceHandle<T> {
+impl<T: ManagedService> ServiceHandle<T> {
+    /// Current health of the backing service.
+    ///
+    /// Calls through to `T`'s `ManagedService` impl via the single inner
+    /// arc. Found by method resolution before the `Deref` chain, so
+    /// `ManagedService` need not be in scope at the call site.
+    pub fn health(&self) -> ServiceHealth { self.inner.health() }
+}
+
+impl<T: ManagedService> Clone for ServiceHandle<T> { /* Arc::clone on inner */ }
+impl<T: ManagedService> Deref for ServiceHandle<T> {
     type Target = T;
     fn deref(&self) -> &T { &self.inner }
 }
@@ -357,12 +375,15 @@ impl DbRateLimitFilter {
 // Hot path: domain call only.
 let conn = self.pool.acquire().await?;
 
-// Checking health (accessible but conventionally registry-only):
-// self.pool.health() — callable but filter authors should not use it.
+// health() is an inherent method on ServiceHandle — no ManagedService
+// import required. Filters may use it for local circuit-breaker decisions.
+if let ServiceHealth::Degraded { reason } = self.pool.health() {
+    return Err(format!("pg_pool degraded: {reason}").into());
+}
 ```
 
 > [!NOTE]
-> See Architecture Decision Record 3 (concrete-type get), 4 (health accessibility), and 9 (PipelineBuildContext).
+> See Architecture Decision Record 3 (concrete-type `get`, type erasure), 4 (`health()` forwarded; `stop()` blocked), and 9 (PipelineBuildContext).
 
 #### Config sketch
 
@@ -462,19 +483,26 @@ does not add a new registration variant.
    > a concern.
 
 3. **Concrete type for `get()`.** `registry.get::<PgPool>(name)`
-   downcasts via `Arc<dyn Any + Send + Sync>`. Lifecycle method
-   accessibility through `Deref` is accepted; enforcement is by
-   convention.
+   requires `T: ManagedService`, but callers need not import
+   `ManagedService` to satisfy the bound — the compiler verifies it from
+   the impl, not from the caller's imports. `ServiceHandle<T: ManagedService>`
+   holds a single `Arc<T>`; the downcast from the registry's internal
+   `Arc<dyn Any + Send + Sync>` is possible because `ManagedService: Any`
+   (enforced by the supertrait). Type erasure happens in
+   `ServiceInstance::new<T: ManagedService>`, the last place `T` is named;
+   after that the registry holds `Arc<dyn ManagedService>` for lifecycle
+   and `Arc<dyn Any + Send + Sync>` for the downcast.
 
-   > [!IMPORTANT]
-   > A future extension using trait-object coercions (`Arc<dyn Pool>`)
-   > would enforce the boundary in the type system but requires
-   > factories to register coercions upfront (see Open Question 3).
-
-4. **`health()` accessible via handle.** Since `ServiceHandle<T>`
-   derefs to `T` and `T: ManagedService`, `handle.health()` is
-   callable from filter code. This is treated as acceptable for
-   the circuit-breaker use case and not restricted.
+4. **`health()` forwarded; `stop()` blocked.** `ServiceHandle<T>`
+   exposes `health()` as an inherent method that delegates to
+   `T::health()` through the single inner arc. Method resolution finds it
+   before the `Deref` chain, so `ManagedService` need not be in scope at
+   the call site. `stop()` is not forwarded; filter code that writes
+   `pool.stop()` gets a compile error unless it explicitly imports
+   `ManagedService`. This is a structural guarantee from module visibility
+   combined with Rust's method resolution rules: `ManagedService` lives in
+   the registry module and Rust requires a trait to be in scope to call its
+   methods via dot syntax.
 
 5. **Startup deadline: global default + per-service override.**
    A global `startup_deadline` under `services:` sets the default
@@ -530,9 +558,11 @@ does not add a new registration variant.
 > scope for this proposal but is a natural follow-on — particularly
 > useful for Kubernetes startup probes.
 
-> [!IMPORTANT]
-> **Trait-object coercion (future).** `ServiceHandle<dyn Pool>`
-> would prevent filter code from reaching lifecycle methods through
-> `Deref`, at the cost of requiring the factory to register
-> coercions at construction time. Left as a future option if the
-> convention-based boundary proves insufficient.
+> [!NOTE]
+> **Trait-object coercion (closed).** `ServiceHandle<dyn Pool>` was
+> considered as a way to prevent lifecycle methods from being reachable
+> through `Deref`. This is no longer needed: `stop()` is blocked
+> structurally (module visibility + Rust method resolution; see ADR-4),
+> and `health()` is intentionally exposed as an inherent method. The
+> coercion approach would add significant complexity (factories must
+> register coercions upfront) with no remaining benefit.
