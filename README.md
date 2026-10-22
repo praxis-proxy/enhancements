@@ -47,7 +47,12 @@ docs/
 proposals/
   template.md             # Proposal template
   NNNNN_slug.md           # Individual proposals
+  NNNNN_slug.asset-NAME.md # Supporting proposal assets
 ```
+
+Keep supporting documents beside their parent proposal, using the parent's
+filename stem followed by `.asset-` and a descriptive name. Assets inherit
+the parent's metadata and lifecycle; they are not separate proposals.
 
 ## Links
 

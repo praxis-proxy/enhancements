@@ -49,6 +49,9 @@ jobs:
           fi
 
           for file in $changed_files; do
+            if [[ "$file" =~ ^proposals/[0-9]+_[a-zA-Z0-9_-]+\.asset-[a-zA-Z0-9_-]+\.md$ ]]; then
+              continue
+            fi
             if [ ! -f "$file" ]; then
               continue
             fi

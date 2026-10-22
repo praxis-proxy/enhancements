@@ -36,6 +36,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           VALID_REPOS="praxis ai operator extproc conventions experiments grid forge policy demos pingora"
           VALID_STATUSES="proposed blocked deferred accepted experimental released withdrawn retroactive"
@@ -55,6 +56,17 @@ jobs:
             status=$(echo "$proposal_files" | jq -r --arg f "$file" '.[] | select(.filename == $f) | .status')
 
             if [ "$status" = "removed" ]; then
+              continue
+            fi
+
+            # Proposal assets inherit their parent's lifecycle and metadata.
+            # Keep them beside the proposal as <stem>.asset-<name>.md.
+            if [[ "$file" =~ ^(proposals/[0-9]+_[a-zA-Z0-9_-]+)\.asset-[a-zA-Z0-9_-]+\.md$ ]]; then
+              parent_file="${BASH_REMATCH[1]}.md"
+              if ! parent_type=$(gh api "repos/${{ github.repository }}/contents/${parent_file}?ref=$HEAD_SHA" \
+                --jq '.type' 2>/dev/null) || [ "$parent_type" != "file" ]; then
+                errors="${errors}\n- \`${file}\`: proposal asset requires parent proposal \`${parent_file}\` at the PR head"
+              fi
               continue
             fi
 
@@ -117,6 +129,26 @@ jobs:
               proposal_name=$(basename "$file" .md | sed 's/^[0-9][0-9]*_//')
               renamed_from=$(echo "$proposal_files" | jq -r --arg b "$proposal_name" \
                 '[.[] | select(.status == "removed") | select(.filename | endswith($b + ".md"))] | length')
+              # A substantial rewrite can appear as added + removed even
+              # when it also renames the slug. Verify the proposal number
+              # and originating issue against the deleted file at the base.
+              if [ "$renamed_from" -eq 0 ] && [ -n "$issue" ]; then
+                proposal_number=$(basename "$file" | cut -d_ -f1)
+                while IFS= read -r previous_file; do
+                  previous_number=$(basename "$previous_file" | cut -d_ -f1)
+                  if [ "$previous_number" != "$proposal_number" ]; then
+                    continue
+                  fi
+                  previous_content=$(gh api "repos/${{ github.repository }}/contents/${previous_file}?ref=$BASE_SHA" \
+                    --jq '.content' | base64 -d)
+                  previous_issue=$(echo "$previous_content" | sed -n '/^---$/,/^---$/p' \
+                    | sed '1d;$d' | grep -E '^issue:' | sed 's/^issue:[[:space:]]*//')
+                  if [ "$previous_issue" = "$issue" ]; then
+                    renamed_from=1
+                    break
+                  fi
+                done < <(echo "$proposal_files" | jq -r '.[] | select(.status == "removed") | .filename')
+              fi
               if [ "$renamed_from" -eq 0 ]; then
                 if echo "$content" | grep -qF '## How?'; then
                   errors="${errors}\n- \`${file}\`: new proposals must not include the \`## How?\` section in the first PR. Submit What? and Why? first; add How? in a follow-up."
