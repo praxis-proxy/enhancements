@@ -387,6 +387,10 @@ Each budget explicitly chooses `drain` or `rollover`; there is **no default**.
 Periods use a fixed duration and UTC anchor. Initialization grants only the
 current period's allowance; the anchor does not create historical grants.
 
+> **First iteration:** Calendar-month renewal, including a chosen start day,
+> is outside this fixed-duration contract. `30d` means 30 days, not a calendar
+> month. A future calendar-period option can define those boundaries explicitly.
+
 - **Drain:** Discard positive, unused allowance at the boundary and grant the
   next period's allowance.
 - **Rollover:** Carry positive, unused allowance and add the next grant.
