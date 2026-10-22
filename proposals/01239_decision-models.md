@@ -1,7 +1,6 @@
 ---
 issue: https://github.com/praxis-proxy/praxis/issues/1239
-discussion: >-
-  Experimental decision models as typed inputs to PPE policy evaluation.
+discussion: https://github.com/praxis-proxy/praxis/issues/1239
 repos:
   - policy
   - praxis
@@ -9,16 +8,55 @@ status: proposed
 authors:
   - rikatz
 graduation_criteria:
-  - Request and response evaluation have bounded execution, protected results,
-    explicit failure handling, and host-controlled external requests.
-  - WAF, prompt-injection, semantic-routing, and PII examples pass end-to-end
-    tests, including unavailable and uncertain evaluations.
-  - Protocol fixtures cover the named reference backends; live checks cover
-    at least one hosted and one local service, with tested versions recorded.
-  - Labeled workload evaluations establish acceptable quality, latency, and
-    resource budgets before enforcement is enabled.
+  - (accepted) Namespace, policy operation syntax, and protected-result shape resolved.
+  - (accepted) Shared prerequisites with 00215 (deadline propagation, explicit
+    dispatch, context refresh, observation) agreed.
+  - (experimental) Feature-flagged implementation in policy and praxis, disabled
+    by default.
+  - (experimental) Versioned protocol fixtures for the six named backends,
+    covering Noul, Choice, Score, per-question errors, model selection, and
+    input limits.
+  - (experimental) Scripted end-to-end tests for the four primary stories in
+    both policy and praxis, including allow/deny, header projection, routing
+    restriction, response withholding, uncertainty, and missing or failed
+    evaluation.
+  - (experimental) Security and failure tests must prove no partial
+    publication, fail-closed for WAF, injection, and PII,
+    timeout/cancellation/late-result discard, oversized or truncated input,
+    missing or rotated secret, no credential leak across redirects, and
+    observer failure cannot change a verdict.
+  - (experimental) Noul, Choice, and Score through APL, CEL, and OPA;
+    categorical results and execution status through Cedar; numeric Cedar
+    explicitly deferred.
+  - (released) Published labeled evaluation per primary story on a versioned
+    corpus (at least 500 benign and 200 positive or adversarial samples),
+    reporting operating point, TPR/FPR, and uncertainty or fallback rate,
+    accepted by policy and security owners.
+  - (released) Benchmarks show PPE overhead within the repository's documented
+    p50 regression threshold; model service time and total latency are reported
+    separately and model time is not charged as overhead.
+  - (released) At least one release cycle or two weeks, whichever is longer, of
+    observational traffic in a representative deployment; canary criteria
+    signed off; disabling inference fails closed for required protections.
+  - (released) No enforcement mode, including canary, before the evaluation
+    report and operator latency and resource budgets are accepted.
+  - (released) policy and praxis keep their documented coverage floor, pass
+    make test in default and all-features mode and lint, and ship their required
+    examples (policy documented example with regression coverage; praxis example
+    config, functional integration test, regenerated README).
+  - (released) Compatibility matrix (fixture-tested backends; live checks
+    optional and recorded when run), operator guidance, failure matrix, and
+    measured budgets published.
 stakeholders:
   - rikatz
+  - TBD
+related:
+  - https://github.com/praxis-proxy/policy/blob/main/docs/proposals/00215_http-external-metadata-pip.md
+experimental_exempt: true
+experimental_exempt_reason: >-
+  Core PPE and host integration changes cannot be prototyped as an external
+  filter; the feature ships disabled by default behind a dedicated Cargo
+  feature.
 ---
 
 # Decision models for PPE
@@ -102,6 +140,8 @@ suitability are evaluated separately.
 
 ## Why?
 
+### Motivation
+
 Policies can already act on attributes. Meaning inside a prompt, tool
 argument, or response often needs interpretation before it becomes an
 attribute. Decision models turn that interpretation into constrained values
@@ -112,10 +152,23 @@ of asking a general language model for the same judgment. The experiment
 must measure that benefit, including network and PPE overhead. A structured
 answer is easier to consume; it can still be wrong.
 
-### User stories
+### User Stories
 
-The first four stories are required demonstrations. The others extend the
-same capability without requiring a separate integration for each detector.
+- As a **policy owner**, I want to define questions, thresholds, failure
+  branches, and actions so that model judgments become enforceable policy.
+- As a **platform operator**, I want to choose inference deployments,
+  approved destinations, credentials, input scope, and resource budgets so
+  that model evaluation stays within approved infrastructure.
+- As a **security and privacy owner**, I want to assess service data
+  handling and detector quality against representative workloads so that
+  disclosure and misclassification risks are understood.
+- As a **PPE maintainer or host integrator**, I want protected results,
+  evaluator projections, transport boundaries, metrics integration, and
+  conformance guarantees so that model evaluation cannot bypass policy
+  controls.
+
+The first four stories below are required demonstrations. The others extend
+the same capability without requiring a separate integration for each detector.
 
 | User need | Model signal | Later PPE action |
 |---|---|---|
@@ -135,16 +188,6 @@ attributes that help the host choose an appropriate model.
 
 These are classifications of the supplied content. They do not establish
 user identity, grant permissions, or prove that an action is safe.
-
-## Who?
-
-- **Policy owners** define questions, thresholds, failure branches, and actions.
-- **Platform operators** choose inference deployments, approved destinations,
-  credentials, input scope, and resource budgets.
-- **Security and privacy owners** assess service data handling and detector
-  quality against representative workloads.
-- **PPE maintainers and host integrators** own protected results, evaluator
-  projections, transport boundaries, metrics integration, and conformance.
 
 ## Architecture
 
@@ -243,7 +286,7 @@ silently stringifying or rounding scores is not compatibility.
 ## Hypothetical configuration examples
 
 This is one PPE policy document with two route examples. It uses the existing
-[configuration structure](../content/configuration.md): plugin declarations,
+[configuration structure](https://github.com/praxis-proxy/policy/blob/main/docs/content/configuration.md): plugin declarations,
 secret providers and values, a global PDP, and route-bound policy. Praxis
 listeners, upstreams, and backend pools are configured in the embedding host.
 
@@ -290,7 +333,7 @@ plugins:
       input: current_http_request
       acknowledge_sensitive_input: true
       purpose: Inspect login requests, including sensitive content, for SQL injection.
-      timeout_milliseconds: 100
+      timeout_milliseconds: 400
       max_input_bytes: 8192
       max_request_bytes: 16384
       max_response_bytes: 4096
@@ -315,7 +358,7 @@ plugins:
       input: current_llm_request
       acknowledge_sensitive_input: true
       purpose: Classify inference requests, including sensitive content, for routing.
-      timeout_milliseconds: 100
+      timeout_milliseconds: 400
       max_input_bytes: 8192
       max_request_bytes: 16384
       max_response_bytes: 4096
@@ -698,10 +741,10 @@ remain separate follow-up proposals.
 [decision-api]: https://decision.vllm-sr.ai/docs
 [llamacpp]: https://huggingface.co/blog/ggml-org/decision-models-in-llamacpp
 [llamacpp-server]: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
-[metadata]: ../content/extensions.md
-[http-payload]: ../../crates/ppe-core/src/http_hook.rs
-[host-services]: ../../crates/ppe-core/src/host.rs
-[pip]: 00215_http-external-metadata-pip.md
-[conventions]: ../dev/conventions.md
+[metadata]: https://github.com/praxis-proxy/policy/blob/main/docs/content/extensions.md
+[http-payload]: https://github.com/praxis-proxy/policy/blob/main/crates/ppe-core/src/http_hook.rs
+[host-services]: https://github.com/praxis-proxy/policy/blob/main/crates/ppe-core/src/host.rs
+[pip]: https://github.com/praxis-proxy/policy/blob/main/docs/proposals/00215_http-external-metadata-pip.md
+[conventions]: https://github.com/praxis-proxy/policy/blob/main/docs/dev/conventions.md
 [prototype]: https://github.com/rikatz/praxis/commit/a3a61b66ffccb4fe48ba8212ff2002010d21fa67
 [prototype-plan]: https://github.com/rikatz/praxis/blob/a3a61b66ffccb4fe48ba8212ff2002010d21fa67/docs/architecture/system-one-decision-filter-plan.md
