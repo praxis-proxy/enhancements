@@ -13,7 +13,7 @@ authors:
 graduation_criteria:
   - Internal and managed stores enforce tenant raw-token and weighted budgets and rate limits
   - Usage reporting works without budgets and preserves raw counts alongside any calculated consumption
-  - Hard and soft rules account for usage and support optional alerts
+  - Hard and soft rules account for usage, preserve trusted over-quota signals, and support optional alerts
   - One-budget selection, shared and reserved allocations, and drain and rollover pass concurrency tests
   - Managed consumption replay and acknowledgment preserve one accounting effect
   - Both stores pass shared fixtures for canonical usage and store-failure outcomes
@@ -108,6 +108,8 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
   without repricing work already admitted, so consumption remains explainable.
 - **Hard and soft limits:** As an application owner, I want either rejection
   or continued accounting at a limit, so I can enforce policy or observe its impact.
+- **Downstream handling:** As an operator, I want a trusted over-quota signal
+  on forwarded requests, so downstream schedulers can deprioritize soft overages.
 - **Optional alerts:** As an operator, I want thresholds in either enforcement
   mode and alerts on hard denials, so I can act when capacity runs low.
 - **Renewal:** As a budget owner, I want to choose use-it-or-lose-it or rollover,
@@ -339,7 +341,7 @@ Every budget and rate limit explicitly selects `enforcement`:
 | Mode | At the limit |
 | --- | --- |
 | **Hard** | Reject admission when its reservation will not fit; return 429 with the limiting rule |
-| **Soft** | Continue, record the overage, and count all usage |
+| **Soft** | Continue with a trusted over-quota signal, record the overage, and count all usage |
 
 Budget availability is funded allowance minus consumption and in-flight holds,
 within the selected allocation. Soft mode does not bypass identity, matching,
@@ -359,6 +361,25 @@ period. Keep old holds attributed to their original period. Rate thresholds obse
 window usage or bucket depletion and rearm below the threshold. `on_denial` reports
 hard denials. Use logs, CloudEvents, and metrics for external Prometheus rules;
 notification delivery stays external.
+
+#### Soft over-quota signal
+
+Soft mode retains trusted `tokenomics.over_quota` request metadata for later
+filters. Set it from the same atomic admission result: true when this attempt's
+reservation would not fit its selected soft budget allocation or any applicable
+soft rate; false otherwise, including exact fits. Hard limits still apply, and
+soft usage is always reserved and settled.
+
+Optional `over_quota.header` forwards the literal value `true` to downstream
+schedulers when over quota; otherwise the header is absent. Strip caller-supplied
+and stale values on every path through Tokenomics, including below-quota and
+hard-only traffic. Omitting this setting disables header projection, not trusted
+metadata or accounting. Consumers may trust the signal only on this configured path.
+
+Replaying an accounting operation returns its original decision. A new inference
+attempt resets and reevaluates the signal, including retries and fallbacks.
+Overage first discovered during settlement is recorded and reported; it cannot
+annotate a request already forwarded. This signal is independent of optional alerts.
 
 #### Renewal
 
@@ -407,6 +428,7 @@ tokenomics:
   estimation:
     kind: request
     fallback: {input_tokens: 4096, output_tokens: 1024}
+  over_quota: {header: x-tokenomics-over-quota} # Optional request-header projection.
   costs:
     - name: sol
       match: {kind: exact, model: gpt-6-sol}
@@ -539,6 +561,7 @@ pub struct Tokenomics {
     pub version: SchemaVersion,
     pub identity: Identity,
     pub estimation: Estimation,
+    pub over_quota: Option<OverQuota>, // Omit to keep the signal internal.
     #[serde(default)]
     pub costs: Vec<Cost>,
     pub tenants: Vec<Tenant>,
@@ -755,15 +778,22 @@ pub struct TokenEstimate {
 }
 ```
 
-##### Enforcement, Alerts, and scalar types
+##### Enforcement, OverQuota, Alerts, and scalar types
 
-Alerts are opt-in. Amounts and intervals arrive as strings so their exact formats
-can be validated before conversion to checked integer arithmetic and durations.
+`OverQuota` optionally projects the trusted admission signal onto a request
+header; alerts are separately opt-in. Amounts and intervals arrive as strings
+for validation before conversion to checked integer arithmetic and durations.
 
 ```rust
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Enforcement { Hard, Soft }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverQuota {
+    pub header: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -805,6 +835,7 @@ Validate the whole policy, including referenced costs, before activation:
 | Matches | At least one exact constraint, or explicit catchall; nonempty exact values; no duplicate or incomparable overlapping matches after resolving references. |
 | Renewal and rates | Explicit renewal mode; valid UTC RFC 3339 anchor; positive integer durations with `ms`, `s`, `m`, `h`, or `d`; rate capacities/refills positive; `max_carry` only with rollover. |
 | Identity and estimates | Valid, distinct header or attribute names; fallback/fixed estimates have a positive total and checked arithmetic. |
+| Over-quota signal | Header, when configured, is a valid nonempty HTTP field name owned by Tokenomics. Reject case-insensitive collisions with identity, authentication, framing, hop-by-hop, reserved names, or other configured header writers. |
 | Alerts | Thresholds positive, unique, and increasing; denial alerts only on hard rules. |
 
 Reject duplicate YAML keys and non-string amounts before type deserialization;
@@ -829,6 +860,7 @@ For traffic with budget enforcement enabled:
    weighted budgets apply each side's highest coefficient until breakdowns are known.
 3. Atomically reserve budget and applicable rate capacity before dispatch. A hard
    denial leaves no partial holds; soft rules still reserve and record usage.
+   Publish the trusted over-quota signal and any configured header projection.
 4. Pin policy, price, allocation, and period to the attempt ID. Chargeable retries
    and fallbacks get new IDs and admission, including rematching the model.
 5. Normalize actual usage from ordinary or streaming responses without buffering
@@ -947,7 +979,8 @@ acknowledged feed. Soft rules support observation without rejection for capacity
    streaming snapshots/deltas. Preserve original usage and the normalization version.
 3. Build typed reserve, settle, and cancel operations with local accounting,
    following the store-failure matrix. Reuse identity, rates, state, and CloudEvents;
-   keep the feature experimental and accounting retries separate from inference.
+   include the trusted admission signal and sanitized header projection. Keep the
+   feature experimental and accounting retries separate from inference.
 4. Implement those same operations through the managed-store contract, including
    atomic settlement with its consumption record, idempotent retries, replay,
    acknowledgment, and recovery. The budget manager owns high availability.
@@ -957,7 +990,8 @@ acknowledged feed. Soft rules support observation without rejection for capacity
    failover, and replay. Feed both stores identical normalized fixtures and assert
    equal consumption. Inject failures before/after dispatch, including lost
    acknowledgments and partial-write attempts; check response codes, reservation
-   transitions, and that accounting failures never replay inference. Publish
+   transitions, and that accounting failures never replay inference. Verify soft
+   signals, exact fits, spoofed headers, and signal reset on new attempts. Publish
    examples and crash-recovery limits, following the [experimental guide].
 
 [state management]: 00099_stateful-proxy-state-management.md
