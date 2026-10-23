@@ -13,6 +13,7 @@ authors:
 graduation_criteria:
   - Internal and managed stores enforce tenant raw-token and weighted budgets and rate limits
   - Usage reporting works without budgets and preserves raw counts alongside any calculated consumption
+  - Both stores report effective tenant quotas, remaining capacity, and overages
   - Hard and soft rules account for usage, preserve trusted over-quota signals, and support optional alerts
   - One-budget selection, shared and reserved allocations, and drain and rollover pass concurrency tests
   - Managed consumption replay and acknowledgment preserve one accounting effect
@@ -132,6 +133,8 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
   consumption records that I acknowledge after saving, so I can recover from interruptions.
 - **Observability:** As an SRE, I want logs, metrics, and CloudEvents from the
   same accounting decisions, so I can explain denials, overages, and reporting gaps.
+- **Quota visibility:** As an application owner, I want my current budget and
+  rate limits reported alongside remaining capacity, so I can plan usage before hitting a limit.
 - **Data minimization:** As an application owner, I want usage records without
   prompts or credentials, so accounting does not become another copy of my request data.
 - **Safe changes:** As an operator, I want invalid updates rejected and live
@@ -963,6 +966,25 @@ export lag, and gaps without unbounded metric labels. Exclude prompts and creden
 CloudEvents delivery is currently best-effort; it supplements the managed store's
 acknowledged feed. Soft rules support observation without rejection for capacity.
 
+#### Quota reporting
+
+Both stores include tenant quota snapshots in admission and settlement logs and
+CloudEvents, including capacity denials, independently of optional alerts.
+Report the selected budget/allocation and every applicable parent or child rate:
+
+| Scope | Snapshot |
+| --- | --- |
+| Budget/allocation | Configured budget limit; allocation allowance including carry, consumed and held amounts, remaining capacity, overage, unit, renewal period, and enforcement mode |
+| Rate | Rule and scope, limit/capacity, window or refill settings, remaining capacity, overage, unit, and enforcement mode |
+
+Label shared balances as shared; they are not a private allowance for each child.
+Use the same exact units and precision as enforcement, reporting exhausted
+capacity as zero remaining plus any overage. Each snapshot carries its own
+accounting scope, policy revision, budget period, and observation time. Internal
+snapshots identify the gateway instance; concurrent traffic can change balances
+afterward. Unavailable values stay unknown, never zero. Reporting without budgets
+omits quota state. Quota reporting does not reserve capacity.
+
 ### Lessons from existing projects
 
 - **[Microsoft API Management]** separates token rates from quotas; its
@@ -990,9 +1012,10 @@ acknowledged feed. Soft rules support observation without rejection for capacity
    acknowledgment, and recovery. The budget manager owns high availability.
 5. Verify reporting without budgets, raw-token and generic weighted accounting,
    matching, unit safety, one-budget selection, shared/reserved pools,
-   drain/rollover, alerts, streaming, concurrency, retries, missing usage, reloads,
-   failover, and replay. Feed both stores identical normalized fixtures and assert
-   equal consumption. Inject failures before/after dispatch, including lost
+   drain/rollover, alerts, quota snapshots, streaming, concurrency, retries,
+   missing usage, reloads, failover, and replay. Feed both stores identical
+   normalized fixtures and assert equal consumption. Inject failures before/after
+   dispatch, including lost
    acknowledgments and partial-write attempts; check response codes, reservation
    transitions, and that accounting failures never replay inference. Verify soft
    signals, exact fits, spoofed headers, and signal reset on new attempts. Publish
