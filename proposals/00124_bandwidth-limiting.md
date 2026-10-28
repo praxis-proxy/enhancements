@@ -8,8 +8,13 @@ authors:
   - rkaplan-hub
 graduation_criteria:
   - How? section with requirements and design
-  - Per-IP state bounds and eviction behavior specified
-  - HTTP and TCP pacing behavior specified, including client disconnect
+  - Body-byte accounting boundary specified, excluding headers, framing, and TLS overhead
+  - Per-connection budget is the downstream client connection, shared by its HTTP/2 streams and successive HTTP/1.1 requests
+  - Burst refills at the byte rate, independently per direction, and a chunk larger than the burst still makes progress
+  - HTTP and TCP pacing applies bounded backpressure without blocking runtime workers, and names where transfer suspends and resumes
+  - A full per-IP table closes a new address, evicts only idle buckets, and does not reset an in-use allowance
+  - Stream reset, TCP half-close, full disconnect, upstream failure, and shutdown each release unused reservations without refunding bytes already sent
+  - Shared locks are not held across a pacing wait or a socket write
 stakeholders:
   - shaneutt
   - twghu
@@ -41,12 +46,37 @@ still saturate the link.
 This proposal adds:
 
 - Independent upload and download ceilings, in bytes
-  per second. On HTTP, upload is the request body and
-  download is the response body. On TCP, upload is
-  client-to-upstream and download is upstream-to-client.
-  Omitting a direction leaves that direction unlimited.
-- Per-connection scope. Each connection has its own
-  upload budget and its own download budget.
+  per second. The ceiling counts body bytes that pass
+  through this filter instance. It is not a cap on
+  every byte on the wire. HTTP headers, framing, and
+  TLS overhead are excluded. On HTTP, upload is the
+  request body and download is the response body. On
+  TCP, upload is client-to-upstream and download is
+  upstream-to-client, counted as the payload this
+  filter forwards. If TLS is terminated before this
+  filter, the decrypted payload is what counts. A body
+  transformation counts only when the transformed
+  bytes pass through this filter. Each retry that
+  sends the body through the filter consumes the
+  allowance again. A cached or locally generated
+  response is paced when its body passes through this
+  filter. Omitting a direction leaves that direction
+  unlimited.
+- Per-connection scope. The budget is the downstream
+  client connection, not an HTTP request and not an
+  upstream connection. Every HTTP/2 stream on that
+  connection, and every later HTTP/1.1 request on a
+  kept-alive connection, shares one upload budget and
+  one download budget. Ten streams under a 1 MiB/s
+  limit stay at 1 MiB/s together. The budget and its
+  burst are created when the connection first reaches
+  this filter instance, and they are released when that
+  downstream connection closes. They are not reset
+  between requests or streams. An upstream connection
+  pool must not merge budgets from different clients.
+  A request on the same downstream connection that
+  reaches a different `bandwidth_limit` instance has
+  that instance's own budget.
 - Per-source-IP scope. Connections from the same source
   IP that pass through one `bandwidth_limit` instance
   share one upload budget and one download budget. That
@@ -56,15 +86,39 @@ This proposal adds:
   Nothing in the process holds a shared map.
 - The same filter on HTTP and TCP listeners.
 - Pacing. Traffic above the limit is delayed so the
-  stream stays at the configured rate. Request admission
-  stays with `rate_limit`.
-- Optional burst. A configured number of bytes may pass
-  immediately before pacing starts, so small bodies are
-  not delayed.
+  stream stays at the configured rate. The delay
+  applies backpressure toward the producer and keeps
+  pending body data bounded, for upload and download.
+  The transfer still streams; the filter does not
+  buffer the whole body. Pacing waits must not block
+  runtime workers. Request admission stays with
+  `rate_limit`.
+- Optional burst. `burst_bytes` is the capacity of a
+  token bucket that refills at the configured byte
+  rate. It is not a one-time allowance. Omitted and
+  zero both mean no burst, so pacing applies from the
+  first byte. Upload and download each have their own
+  burst of that size. In `per_ip` mode the burst
+  belongs to the shared budget, so another connection
+  from the same IP does not receive a new one. A body
+  chunk larger than the burst must still move,
+  incrementally, as tokens refill. It must not wait
+  until the whole chunk fits in the bucket. A small
+  body avoids delay only while that direction's budget
+  still has burst available.
 - Bounded local state for per-IP budgets, in the same
   spirit as the existing per-IP rate limiter: a cap on
   tracked addresses, idle eviction, and metrics for map
-  size and evictions.
+  size and evictions. A bucket can be evicted only
+  when it has no active connection and no waiter.
+  Evicting or recreating a bucket must not give an IP
+  that still has a connection a second budget or a
+  fresh burst. When the table is full, a connection
+  from an untracked IP is closed instead of paced.
+  That close is the one case that is rejected rather
+  than delayed. Waiters and queued bytes for a tracked IP
+  stay bounded. The same outcomes apply to HTTP and
+  TCP.
 
 ### Goals
 
@@ -74,8 +128,16 @@ This proposal adds:
   separate controls that can be used together.
 - Apply the same limits on HTTP body streams and on
   TCP connections.
-- Stop pacing a connection when the client disconnects,
-  so a slow or gone peer does not hold a shared budget.
+- Cancel pacing for the work that actually ended.
+  An HTTP/2 stream reset cancels only that stream.
+  Sibling streams keep using the shared budget. A TCP
+  client that half-closes after its upload still
+  receives the download. Full disconnect, upstream
+  failure, and shutdown release unused reservations
+  and waiter state without refunding bytes already
+  sent. A slow reader that stays connected is not a
+  disconnect and can still consume a shared per-IP
+  budget.
 - Keep each per-IP map inside its filter instance and
   bounded in memory. Listener chains do not share it. A
   budget shared across instances or replicas belongs
@@ -197,9 +259,11 @@ if a later issue requires them.
   that HTTP and TCP entry points follow one policy.
 - As an SRE, I want excess traffic delayed rather than
   rejected so that large transfers complete at a steady
-  rate.
+  rate, except when the per-IP table is full and the
+  address is new.
 - As an operator, I want a burst allowance so that small
-  API calls are not delayed by pacing.
+  API calls are not delayed while that budget still has
+  burst available.
 
 ### Non-Goals
 
