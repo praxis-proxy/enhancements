@@ -10,9 +10,9 @@ graduation_criteria:
   - How? section with requirements and design
   - Body-byte accounting boundary specified, excluding headers, framing, and TLS overhead
   - Per-connection budget is the downstream client connection, shared by its HTTP/2 streams and successive HTTP/1.1 requests
-  - Burst refills at the byte rate, independently per direction, and a chunk larger than the burst still makes progress
+  - A positive burst refills at the byte rate, independently per direction; omitted and zero are a no-burst mode; both modes make progress on a nonempty transfer, including a chunk larger than the burst
   - HTTP and TCP pacing applies bounded backpressure without blocking runtime workers, and names where transfer suspends and resumes
-  - A full per-IP table closes a new address, evicts only idle buckets, and does not reset an in-use allowance
+  - A full per-IP table closes a new address, and eviction or recreation preserves the remaining allowance across reconnects, including while the IP has no connection
   - Stream reset, TCP half-close, full disconnect, upstream failure, and shutdown each release unused reservations without refunding bytes already sent
   - Shared locks are not held across a pacing wait or a socket write
 stakeholders:
@@ -54,14 +54,16 @@ This proposal adds:
   TCP, upload is client-to-upstream and download is
   upstream-to-client, counted as the payload this
   filter forwards. If TLS is terminated before this
-  filter, the decrypted payload is what counts. A body
-  transformation counts only when the transformed
-  bytes pass through this filter. Each retry that
-  sends the body through the filter consumes the
-  allowance again. A cached or locally generated
-  response is paced when its body passes through this
-  filter. Omitting a direction leaves that direction
-  unlimited.
+  filter, the decrypted payload is what counts.
+  Operators choose the counting stage, including
+  before or after compression, by where they place
+  this filter. Bytes are counted at that position.
+  Each replayed upstream upload is charged once per
+  attempt. Cached and locally generated response
+  bodies are included and paced. A body that never
+  enters this filter is outside the ceiling. That is
+  a placement limit, not a second accounting rule.
+  Omitting a direction leaves that direction unlimited.
 - Per-connection scope. The budget is the downstream
   client connection, not an HTTP request and not an
   upstream connection. Every HTTP/2 stream on that
@@ -93,28 +95,36 @@ This proposal adds:
   buffer the whole body. Pacing waits must not block
   runtime workers. Request admission stays with
   `rate_limit`.
-- Optional burst. `burst_bytes` is the capacity of a
-  token bucket that refills at the configured byte
-  rate. It is not a one-time allowance. Omitted and
-  zero both mean no burst, so pacing applies from the
-  first byte. Upload and download each have their own
+- Optional burst. When `burst_bytes` is greater than
+  zero, it is the capacity of a token bucket that
+  refills at the configured byte rate. It is not a
+  one-time allowance. Omitting it, or setting it to
+  zero, is a separate no-burst mode, not a bucket of
+  capacity zero. In that mode pacing applies from the
+  first byte, and a nonempty transfer must still make
+  progress. Upload and download each have their own
   burst of that size. In `per_ip` mode the burst
   belongs to the shared budget, so another connection
   from the same IP does not receive a new one. A body
   chunk larger than the burst must still move,
   incrementally, as tokens refill. It must not wait
-  until the whole chunk fits in the bucket. A small
+  until the whole chunk fits in the bucket. The same
+  progress rule applies in no-burst mode. A small
   body avoids delay only while that direction's budget
   still has burst available.
 - Bounded local state for per-IP budgets, in the same
   spirit as the existing per-IP rate limiter: a cap on
   tracked addresses, idle eviction, and metrics for map
-  size and evictions. A bucket can be evicted only
-  when it has no active connection and no waiter.
-  Evicting or recreating a bucket must not give an IP
-  that still has a connection a second budget or a
-  fresh burst. When the table is full, a connection
-  from an untracked IP is closed instead of paced.
+  size and evictions. Evicting or recreating a bucket
+  must preserve the remaining per-IP allowance,
+  including while that IP has no connection. A depleted
+  bucket stays tracked until a normal refill would
+  make a new full bucket equivalent. Debt and unused
+  reservations stay with that allowance. A reconnect
+  before then does not receive a fresh burst. An IP is
+  never given a second budget. When the table is full,
+  a connection from an untracked IP is closed instead
+  of paced.
   That close is the one case that is rejected rather
   than delayed. Waiters and queued bytes for a tracked IP
   stay bounded. The same outcomes apply to HTTP and
