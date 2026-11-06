@@ -11,11 +11,13 @@ authors:
   - jland-redhat
   - asaadbalum
 graduation_criteria:
-  - Internal and managed stores enforce tenant raw-token and weighted budgets and rate limits
   - Usage reporting works without budgets and preserves raw counts alongside any calculated consumption
-  - Both stores report effective tenant quotas, remaining capacity, and overages
+  - Rate limits enforce independently of FinOps entitlement and remain available whether or not go/no-go is enabled
+  - Subject-keyed external entitlement (go/no-go MVP) can drive admit, including by pushing the decision onto the hot path, with documented refresh / raise-limit hooks
+  - Internal and managed stores can enforce tenant raw-token and weighted budgets and rate limits when local budget enforcement is enabled
+  - Both stores report effective tenant quotas, remaining capacity, and overages when local budgets are enabled
   - Hard and soft rules account for usage, preserve trusted over-quota signals, and support optional alerts
-  - One-budget selection, shared and reserved allocations, and drain and rollover pass concurrency tests
+  - One-budget selection, shared and reserved allocations, and drain and rollover pass concurrency tests for the local budget engine
   - Managed consumption replay and acknowledgment preserve one accounting effect
   - Both stores pass shared fixtures for canonical usage and store-failure outcomes
   - Missing stores, outages, reloads, and lost usage have tested and documented behavior
@@ -64,29 +66,54 @@ origin:
 
 ## What?
 
-**Tokenomics** gives applications a budget for inference and controls how
-quickly they spend it. Praxis enforces token, rate, and cost limits, reports
-consumption, and emits optional alerts.
+**Tokenomics** gives applications limits for inference and controls how
+quickly they spend against those limits. Praxis enforces token and rate
+limits, reports consumption, emits optional alerts, and admits traffic against
+a limit decision — including limits that an external system owns.
 
 | Measure | Meaning |
 | --- | --- |
 | Tokens | Input and output usage, including cache and reasoning breakdowns |
 | Rate | Requests or tokens over time |
-| Cost | Tokens weighted by type, model, and capabilities, in a declared budget unit |
+| Cost | Tokens weighted by type, model, and capabilities, in a declared budget unit (when local weighted accounting is used) |
 
 Count tokens directly, or assign weights so expensive models spend more of the
-same budget. The unit can be credits, USD, or another operator-defined quantity.
-Budget enforcement requires an explicit internal or highly-available store;
-usage reporting also works on its own.
+same local allowance when that path is enabled. The unit can be **credits**,
+USD, or another operator-defined quantity.
+
+**Credits** are a **stable unit**: a dimensionless baseline used to compare
+token types (and models) against one another via weights — for example so
+output or reasoning can cost more “credits” than cached input. Praxis does
+**not** define what one credit converts to in money or any other real-world
+quantity; that mapping is left to **user / operator preference** (and, when
+commercial pricing matters, to the external budget manager or meter).
+
+**Usage reporting works on its own** and is the foundation: send accurate
+consumption to a budget manager or external meter. Local budget enforcement
+(internal or highly-available store) remains available for simple deployments;
+**wallet balance, drain, and commercial cut-off are better owned outside
+Praxis** by a budget manager / metering system that Praxis hooks into (see
+Ownership).
+
+Admission should stay flexible: start with a subject-keyed **go / no-go**
+decision (user, organization, agent) that can be **pushed into the hot path**
+(sync check or local mirror — both valid), and allow that decision to already
+reflect non-token spend calculated elsewhere (for example GPU usage) without
+Praxis becoming the multi-product ledger. **Normal rate limiting remains an
+independent option** either way.
 
 ## Why?
 
 AI inference platforms need to control who spends, how much, and how fast.
 Realtime applications and background jobs share funding but need different
-priority. Enforce that close to inference, and send usage back to a budget manager.
+priority. Enforce close to inference, and send usage back to a budget manager.
 
 Praxis supplies enforcement and the contract. Operators choose their budget
-manager and infrastructure. Simple deployments start with YAML and an internal store.
+manager and infrastructure. Simple deployments can start with YAML and an
+internal store; managed and commercial deployments should treat the budget
+manager (or external meter) as the place that **specifies limits and raises
+them**, with Praxis applying the resulting admit decision rather than owning
+a drained commercial wallet.
 
 ### User Stories
 
@@ -112,10 +139,24 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
   and token type, so expensive output and discounted cache usage count differently.
 - **Consistent usage:** As a budget owner, I want providers' token breakdowns
   counted once, so the same usage consumes the same allowance in either store.
+- **Flexible usage capture:** As a model owner, I want a flexible enough system
+  to define how my usage metrics are captured, so different model APIs can report
+  the units that matter for that model without forcing one fixed shape.
+  - That may be a value **other than tokens** — for example **duration** for
+    some text-to-speech models.
 - **Simple cost management:** As an operator, I want to supply USD-per-token
   rates and receive USD consumption, so a small budget manager needs no conversion layer.
 - **Usage without budgets:** As an integrator, I want raw tokens and capabilities
   without configuring budgets or prices, so I can analyze and price usage externally.
+- **External limits:** As a platform owner, I want Praxis to enforce limits an
+  external budget manager or meter defines (and can raise), so commercial wallet
+  drain and top-up stay outside the gateway application.
+- **Go/no-go admission:** As a gateway operator, I want a subject-keyed allow/deny
+  hook (user, organization, or agent) for spend entitlement that can be pushed
+  into the hot path, while normal rate limiting stays available as its own control.
+- **Composite entitlement:** As a FinOps integrator, I want non-token cost already
+  calculated outside Praxis (for example GPU usage) to influence the same
+  entitlement decision before it reaches admission.
 - **Reusable prices:** As an operator, I want shared prices and budget-local
   prices together, so common pricing is maintained once and exceptions stay local.
 - **Explicit coverage:** As an operator, I want unmatched requests rejected
@@ -143,7 +184,8 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
 - **Simple deployment:** As a developer or small-deployment operator, I want
   static YAML budgets and local renewal without running another service.
 - **Managed deployment:** As an operator, I want my budget manager to own
-  persistence and high availability, so Praxis does not become another budget management product.
+  persistence, high availability, and commercial wallet semantics, so Praxis does
+  not become another budget management or billing product.
 - **Reliable feedback:** As a budget manager integrator, I want replayable
   consumption records that I acknowledge after saving, so I can recover from interruptions.
 - **Observability:** As an SRE, I want logs, metrics, and CloudEvents from the
@@ -160,7 +202,12 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
 ### Goals
 
 - Give operators one clear API for tenants, budgets, costs, rates, and alerts.
-- Support shared and protected allocations with predictable accounting.
+- Support shared and protected allocations with predictable accounting when local
+  budget enforcement is used.
+- Prefer **usage export + entitlement hooks** for commercial spend cut-off, so a
+  budget manager / meter can own limits (including non-token cost) and Praxis
+  can apply a go/no-go (or richer) decision on the hot path — including a pushed
+  or mirrored entitlement — without replacing normal rate limiting.
 - Keep local deployments useful and managed deployments independent of a store product.
 - Reuse Praxis authentication, token extraction, rate limiting, state, and CloudEvents.
 - Make usage and failure behavior visible to the budget manager and operator.
@@ -168,6 +215,8 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
 ### Non-goals
 
 - Building an upstream budget management service, billing system, or general ledger.
+- Owning commercial wallet balance, drain, top-up, or invoice pricing as Praxis
+  source of truth (the budget manager / external meter owns that).
 - Managing external store replication, failover, persistence, or deployment.
 - Currency conversion, exchange-rate sourcing, or other financial pricing policy.
 - Mixing accounting methods or units within a tenant, or charging several budgets per request.
@@ -190,23 +239,35 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
 
 ### Ownership and Storage
 
-Praxis resolves tenants, enforces policies, reserves capacity, and records usage.
-The **budget manager** owns tenants' managed policies, prices, allocations,
-reconciliation, durable history, and all high-availability concerns.
+Praxis resolves tenants, enforces policies, records usage, and applies admit
+decisions. The **budget manager** owns tenants' managed policies, prices,
+allocations, reconciliation, durable history, high-availability concerns, and —
+for commercial spend — **wallet balance, cut-off, and limit increases**.
+
+Two complementary shapes:
+
+| Shape | When | What Praxis does |
+| --- | --- | --- |
+| **Local budget enforcement** | Simple / dogfood deployments | YAML or managed store supplies allowances; Praxis may reserve/settle against that store |
+| **External entitlement** | Managed / commercial meters | Budget manager (or meter) decides go/no-go (possibly after folding GPU and other non-token cost); Praxis applies that decision on the hot path via a **pushed/mirrored entitlement** and/or an explicit hot-path check — rate limits stay independently configurable |
 
 | Store | Configuration and ownership |
 | --- | --- |
 | **Internal K/V** | YAML supplies policies; Praxis maintains local accounting and renewal |
 | **Highly-available store** | The budget manager supplies policies and operates the backing system; Praxis consumes the contract and records usage |
+| **Entitlement on the hot path** (external shape) | Adaptor / manager pushes subject-keyed entitlement into Praxis (local seam and/or sync check); Praxis evaluates it at admit alongside optional rate limits |
 
-Topology and failover are opaque to Praxis. The integration must provide atomic
-admission, idempotent settlement, and acknowledged consumption records; high
-availability alone does not guarantee those semantics.
+Topology and failover are opaque to Praxis. Where local reserve/settle is used,
+the integration must provide atomic admission, idempotent settlement, and
+acknowledged consumption records; high availability alone does not guarantee
+those semantics. Where external entitlement is used, the integration must
+document how the go/no-go decision reaches the hot path (push/mirror vs sync
+check), freshness / fail-open vs fail-closed, and how limit raises propagate.
 
-**A root tenant _must_ specify `store`**, naming a K/V backend from [state
-management]. Children inherit it. Never default or fall back to memory.
-Unavailable or untrustworthy accounting blocks admission, including for soft
-budgets.
+**When local budget enforcement is enabled, a root tenant _must_ specify
+`store`**, naming a K/V backend from [state management]. Children inherit it.
+Never default or fall back to memory. Unavailable or untrustworthy accounting
+blocks admission, including for soft budgets.
 
 Internal accounting survives reloads, but not process restarts. Replicas have
 independent balances. Managed-store durability and recovery are the budget
@@ -274,8 +335,10 @@ A root tenant selects one accounting method, inherited by its budgets and childr
 
 Praxis compares unit identifiers for consistency and includes them in reports.
 It does not interpret currencies or fetch exchange rates. USD-per-token prices
-and credits-per-token weights use the same arithmetic and rate table. A simple
-manager can therefore use USD directly, without translating it to an intermediate unit.
+and credits-per-token weights use the same arithmetic and rate table. When the
+unit is credits, coefficients are relative weights against that stable unit —
+not a prescribed money conversion. A simple manager can use USD directly when
+that is the chosen unit, without forcing credits as an intermediate.
 
 > **API direction:** Future unit-specific shorthand can expand into this same
 > weighted form, preserving exact coefficients without implicit conversion.
@@ -379,7 +442,19 @@ perform accounting.
 Reporting without budgets is an explicit pipeline choice, never a fallback for
 failed matching or unavailable budget state.
 
+This path is also the right foundation for **external entitlement**: export
+usage to the budget manager / meter, let that system rate and decide (including
+non-token cost), then push the go/no-go decision into Praxis admission (hot-path
+check and/or local mirror). Rate limits remain optional and independent.
+
 ### Budgets, rates, and alerts
+
+> **Product lean:** Treat the detailed local allowance, renewal (drain/rollover),
+> and reserve/settle behavior below as the **in-cluster budget engine** for
+> deployments that need it. Prefer the budget manager owning commercial wallet
+> drain and limit raises, with Praxis able to enforce **normal rate limiting**
+> and/or a **hot-path go/no-go** entitlement decision. The sections below remain
+> the contract when local budgets are on.
 
 Every budget and rate limit explicitly selects `enforcement`:
 
@@ -992,13 +1067,15 @@ store product. Keep writer ownership clear:
 
 | Writer | Data |
 | --- | --- |
-| Budget manager | Tenant policies, costs, allocations, allowance revisions, and reconciled corrections |
-| Praxis accounting operations | Holds, consumption, rate state, attempt deduplication, and consumption records |
+| Budget manager | Tenant policies, costs, allocations, allowance revisions, reconciled corrections, and (for external entitlement) go/no-go decisions / limit raises pushed into Praxis |
+| Praxis accounting operations | Holds, consumption, rate state, attempt deduplication, and consumption records (when local budgets are enabled); always usage export |
 
-The integration applies coherent policy revisions and atomic accounting operations.
+The integration applies coherent policy revisions and atomic accounting operations
+when local budgets are used.
 Corrections and top-ups are idempotent operations, never remaining-balance
 overwrites. Corrections and late gateway settlements resolve the same attempt
-without charging twice.
+without charging twice. For external entitlement, top-ups appear as refreshed
+local go decisions — not as Praxis rewriting a commercial wallet balance.
 
 Settlement atomically updates accounting and records consumption. The manager
 persists replayed records idempotently, then acknowledges them. Acknowledgment
@@ -1057,29 +1134,32 @@ omits quota state. Quota reporting does not reserve capacity.
 
 ### Implementation plan
 
-1. Review the YAML, types, validation, revisions, allocation/renewal behavior,
-   canonical usage, failure outcomes, and consumption records with users and
-   budget manager implementers.
+1. Review direction with users and budget manager implementers: usage-first,
+   external entitlement hooks for commercial cut-off, and local budgets as an
+   optional in-cluster engine. Align YAML/types for local budgets with that split.
 2. Build one shared usage normalizer from the existing provider extractors.
    Cover included and standalone counts, missing fields, invalid totals, and
    streaming snapshots/deltas. Preserve original usage and the normalization version.
-3. Build typed reserve, settle, and cancel operations with local accounting,
-   following the store-failure matrix. Reuse identity, rates, state, and CloudEvents;
-   include the trusted admission signal and sanitized header projection. Keep the
-   feature experimental and accounting retries separate from inference.
-4. Implement those same operations through the managed-store contract, including
-   atomic settlement with its consumption record, idempotent retries, replay,
-   acknowledgment, and recovery. The budget manager owns high availability.
-5. Verify reporting without budgets, raw-token and generic weighted accounting,
-   matching, unit safety, one-budget selection, shared/reserved pools,
-   drain/rollover, alerts, quota snapshots, streaming, concurrency, retries,
-   missing usage, reloads, failover, and replay. Feed both stores identical
-   normalized fixtures and assert equal consumption. Inject failures before/after
-   dispatch, including lost
-   acknowledgments and partial-write attempts; check response codes, reservation
-   transitions, and that accounting failures never replay inference. Verify soft
-   signals, exact fits, spoofed headers, and signal reset on new attempts. Publish
-   examples and crash-recovery limits, following the [experimental guide].
+3. Define entitlement push into the hot path + refresh / raise-limit hooks
+   (go/no-go MVP; subject keys for user / org / agent). Support mirror and/or
+   sync check; keep rate limiting independently configurable.
+4. Build typed reserve, settle, and cancel operations with local accounting
+   where local budgets are enabled, following the store-failure matrix. Reuse
+   identity, rates, state, and CloudEvents; include the trusted admission signal
+   and sanitized header projection. Keep the feature experimental and accounting
+   retries separate from inference.
+5. Implement managed-store operations for local budgets, including atomic
+   settlement with its consumption record, idempotent retries, replay,
+   acknowledgment, and recovery. The budget manager owns high availability and
+   commercial wallet semantics.
+6. Verify reporting without budgets, entitlement admit/deny + refresh, rate
+   limits, and (when enabled) raw-token and weighted local accounting, matching,
+   unit safety, one-budget selection, shared/reserved pools, drain/rollover,
+   alerts, quota snapshots, streaming, concurrency, retries, missing usage,
+   reloads, failover, and replay. Feed stores identical normalized fixtures
+   where applicable. Inject failures before/after dispatch; check that accounting
+   failures never replay inference. Publish examples and crash-recovery limits,
+   following the [experimental guide].
 
 ## Open Questions
 
