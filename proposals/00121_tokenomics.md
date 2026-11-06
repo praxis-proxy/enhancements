@@ -20,6 +20,19 @@ graduation_criteria:
   - Both stores pass shared fixtures for canonical usage and store-failure outcomes
   - Missing stores, outages, reloads, and lost usage have tested and documented behavior
   - Configuration examples, CloudEvents, logs, and rollout guidance are published
+  - Rate-limit checks and budget accounting are separated with a defined admission order, or the use case requiring one atomic transaction is stated
+  - Store implementations are classified by whether they provide atomic reservation and idempotent settlement, and configurations selecting one without both are rejected
+  - Usage arriving after a rate window closes has defined accounting, with a worked example
+  - Every upstream attempt has a named owner for settle, cancel, or retain-unresolved, including retries below the pipeline and dropped streams
+  - Settlement deduplication outlives consumption-record cleanup, with a stated rule for rejecting retries after deduplication records expire
+  - Operator inspection and reconciliation of retained holds is specified, with a cap on retained holds and the response when it is reached
+  - Fleet coherence is specified: how many proxies share one allowance, and which variables the accounting error scales with
+  - Reservation waste, retained-hold memory, and an accepted overspend error budget are quantified from measurements
+  - The proposal states what must not sit on the admission path, and whether blocking admission is an operator knob
+  - Burst behavior within a window is specified, with the risks of window-bound-only budgets identified
+  - Batch and async semantics are specified or explicitly deferred, with the MVP `batch` label scoped accordingly
+  - Tokenomics works from trusted request identity alone, with Praxis authentication one source rather than a requirement
+  - Each contradiction flagged is resolved or withdrawn
 stakeholders:
   - jland-redhat
   - leseb
@@ -39,6 +52,8 @@ related:
   - https://github.com/praxis-proxy/ai/issues/126
   - https://github.com/praxis-proxy/ai/issues/979
   - https://github.com/praxis-proxy/ai/issues/1241
+  - https://github.com/praxis-proxy/enhancements/pull/32
+  - https://github.com/praxis-proxy/enhancements/pull/35
 origin:
   repo: ai
   issue: https://github.com/praxis-proxy/ai/issues/121
@@ -159,6 +174,16 @@ manager and infrastructure. Simple deployments start with YAML and an internal s
 - Arbitrary matching expressions, grandchildren, or scheduled policy changes in this iteration.
 - Per-tool or per-image charges, provider-managed batch jobs, or a zero-overspend guarantee in this iteration.
 
+> [!WARNING]
+> **Unresolved contradiction C2 — non-goal versus requirement.** This section
+> rules out building a general ledger, but *Budgets, rates, and alerts* goes on
+> to require rollover with `max_carry`, debt that survives a period boundary
+> ("Never renew away debt or treat pending holds as unused allowance"), and
+> carry split across allocations with rounding and missed boundaries applied
+> once in order. Those are ledger behaviors. Either the non-goal or those
+> requirements has to give.
+> See [PR 32 review ledger], C2.
+
 > **API direction:** Named objects, references, and explicit variants keep the
 > API growable. Lists leave room for later capabilities; validation rejects
 > unsupported combinations today. Scope limits may change with demand.
@@ -186,6 +211,23 @@ budgets.
 Internal accounting survives reloads, but not process restarts. Replicas have
 independent balances. Managed-store durability and recovery are the budget
 manager's responsibility and must be documented by the integration.
+
+> [!WARNING]
+> **Unresolved contradiction C1 — the proposal's own thesis.** *Why?* places
+> the ledger outside the proxy: "Enforce that close to inference, and send
+> usage back to a budget manager." The Internal K/V row above has Praxis
+> maintain "local accounting and renewal", and *Budgets, rates, and alerts*
+> puts renewal on the admission path ("Local admission checks renewal"). That
+> is a ledger inside the proxy, whichever store holds the data at rest.
+> See [PR 32 review ledger], C1.
+
+> [!WARNING]
+> **Unresolved contradiction C3 — manager owns HA, gateway liveness depends on
+> it.** The budget manager is declared owner of "all high-availability
+> concerns" above, yet *Feedback to the budget manager* has Praxis "stop
+> admission early enough to preserve room for in-flight settlements" when the
+> backlog fills. Gateway liveness is coupled to a component this section puts
+> out of scope. See [PR 32 review ledger], C3.
 
 ### Tenants and budget selection
 
@@ -879,6 +921,24 @@ Estimates can underrun actual usage. Record the full charge and block subsequent
 hard admission without capacity. In local mode, unresolved holds remain charged
 conservatively and visible for operator reconciliation; timers cannot erase them.
 
+> [!WARNING]
+> **Unresolved contradiction C4 — exactness is paid for, then disclaimed.**
+> Step 3 mandates one atomic reservation of budget *and* rate capacity, and
+> *Ownership and Storage* requires atomic admission from the integration. That
+> buys latency, serialization and backpressure on the admission path. *Non-goals*
+> then declares no zero-overspend guarantee, and the paragraph above accepts
+> that estimates underrun actual usage. Simulation with an atomic store measured
+> 28-55% overshoot: the cost of exact concurrency is paid, the totals are still
+> inexact. See [PR 32 review ledger], C4.
+
+> [!WARNING]
+> **Unresolved question — joint budget and rate transaction.** Whether rate
+> capacity must participate in the same transaction as the budget reservation
+> was questioned by two reviewers and the author stated a preference for
+> separating them. That direction was never written down. Step 3 above still
+> mandates the joint reservation. See [PR 32 review ledger], sections 1 and
+> 2.4.
+
 > **Later iteration:** Model tokenizers can remove input estimation error.
 > A zero-overspend mode also needs enforceable bounds on output and every weighted
 > capability. Exact input counting alone cannot promise that guarantee.
@@ -1021,6 +1081,86 @@ omits quota state. Quota reporting does not reserve capacity.
    signals, exact fits, spoofed headers, and signal reset on new attempts. Publish
    examples and crash-recovery limits, following the [experimental guide].
 
+## Open Questions
+
+> [!NOTE]
+> These were raised reviewing [PR #32] after this document's last content
+> change (`1e60bfb`, 2026-10-23) and were not folded into the text before it
+> merged as `proposed` via [PR #35]. The full threads, with attribution and
+> permalinks, are in the [PR 32 review ledger]. Each item below is also a
+> graduation criterion: none of them blocks the document existing, all of them
+> block `proposed` advancing to `accepted`.
+
+### Agreed in review, not yet reflected here
+
+- **Separate rate limiting from budget accounting.** The author's stated
+  preference is to split them and define how a request passes through both,
+  with budget reservations protecting the shared allowance but rate counters
+  not necessarily joining the same transaction. The document still mandates the
+  joint atomic reservation. If a use case genuinely requires the single
+  transaction, this should say which one and why.
+- **Consequence to record either way.** Under the current joint design, rate
+  limiters that are not ledgers — PPE/Limitador among them — are not composable
+  into Tokenomics and would need a standalone solution.
+
+### Store and accounting semantics
+
+- Which store implementations may reserve and settle, given that concurrent
+  requests must not reserve the same allowance and a settlement retry must not
+  charge twice. Configurations selecting a store without those guarantees
+  should be rejected.
+- Whether YAML-defined budgets with shared counters are supported for simpler
+  deployments, with the budget manager retained for managed policies,
+  reconciliation and durable history.
+- How usage is counted when it arrives after the rate window has closed —
+  reserve 100, spend 1,000, and whether the excess 900 reduces the allowance
+  available to new requests. A worked example is wanted.
+- Which component sees every upstream attempt and owns its accounting, given
+  retries below the request pipeline and dropped streams that never reach the
+  response callback.
+- How settlement deduplication outlives consumption-record cleanup, and the
+  rule for rejecting a delayed retry once deduplication records have expired.
+- How an operator inspects and reconciles retained holds, the cap on retained
+  holds, and the response when that cap is reached. Soft mode otherwise keeps
+  admitting while unresolved state grows.
+
+### Scale, cost, and failure
+
+- **Fleet coherence.** How many proxies share one allowance. *Ownership and
+  Storage* offers only "Replicas have independent balances" or "the budget
+  manager's responsibility", with nothing in between, and the document does not
+  say which variables the accounting error scales with.
+- **Cost.** How much state a gateway holds and for how long; how much
+  reservation waste the design accepts, quantified rather than asserted; an
+  error budget with acceptance criteria; and the budget manager's own cost at
+  scale, which cross-cluster experience suggests is not free.
+- **Failure ownership.** Whether "who absorbs the uncertainty" — operator
+  revenue or customer availability — should be an operator knob, and likewise
+  whether blocking admission is the only permitted blast radius. The design is
+  built on the block-admission outcome.
+- **Admission path.** What must *not* sit on the admission path. The document
+  currently puts everything there.
+- **Burst.** Budgets are window-bound rather than burst-bound; the resulting
+  risks should be identified and quantified.
+- **System of record is not admission authority.** The two roles are currently
+  conflated.
+
+### Scope
+
+- **Batch and async.** Batch appears as shared funding with realtime traffic
+  and in child-tenant examples, which understates it: long-lived or deferred
+  reservations, settlement far from dispatch, and fairness against interactive
+  traffic are all different problems. Real batch semantics should be explicitly
+  deferred, with the MVP keeping only a `batch` label under a shared budget and
+  not implying more.
+- **Authentication coupling.** The *Goals* entry "Reuse Praxis authentication,
+  token extraction, rate limiting, state, and CloudEvents" ties Tokenomics to
+  Praxis auth. It needs only trusted identity already on the request, from
+  whatever sat upstream; Praxis authentication should be one source of that,
+  not a requirement.
+
+[PR #32]: https://github.com/praxis-proxy/enhancements/pull/32
+[PR #35]: https://github.com/praxis-proxy/enhancements/pull/35
 [state management]: 00099_stateful-proxy-state-management.md
 [experimental guide]: ../docs/experimental-phase.md
 [Serde's enum representation]: https://github.com/serde-rs/serde-rs.github.io/blob/master/_src/enum-representations.md
