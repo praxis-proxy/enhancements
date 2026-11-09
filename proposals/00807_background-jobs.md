@@ -17,7 +17,6 @@ experimental_exempt: true
 experimental_exempt_reason: "Server and filter-framework infrastructure, with no filter to prototype in the experimental repo."
 related:
   - 01042
-  - https://github.com/praxis-proxy/praxis/issues/1042
 ---
 
 # Background Jobs
@@ -47,8 +46,7 @@ response phase, bounded by a deadline and a
 response-size ceiling. An existing test in
 `crates/filter/src/filtered_subrequest/tests.rs`
 drives exactly that against a real backend today,
-and `IrrStepRunner` is a working consumer in about
-a hundred lines.
+and `IrrStepRunner` is a working consumer.
 
 So this is not a proposal for an execution engine.
 It is a proposal for the parts missing around one:
@@ -67,6 +65,10 @@ a queue, workers, and a lifetime.
   listener is a bug.
 - Drain on shutdown, or move jobs to a documented
   terminal state.
+- Surface every accepted job's terminal outcome,
+  including abnormal termination (a worker panic),
+  so a consumer is never left waiting on a job that
+  will not finish.
 
 ### Non-Goals
 
@@ -107,11 +109,16 @@ The concrete consumer is OpenAI Responses
 background mode (praxis-proxy/ai#32): accept a
 request, return it as queued immediately, run it
 later through the configured path, and let the
-client poll or cancel it. The AI gateway cannot
-build that on its own without either spawning a
-private runtime, which is the pattern 01042 exists
-to stop, or reaching into server internals it has
-no access to.
+client poll or cancel it. The AI gateway could
+approximate this on the server's existing
+background-service mechanism, but every consumer
+building on it privately would grow its own
+scheduler and shutdown story. The stronger reason
+for core support is shared lifecycle
+infrastructure: one queue, one worker pool, and
+one supervision story instead of N duplicates,
+with queue workers themselves free to run on the
+existing background-service mechanism.
 
 ### Relationship to ENH #1042
 
@@ -131,10 +138,6 @@ listener. Jobs therefore want process lifetime and
 a reload-durable registry, which is the pattern
 `KvStoreRegistry`, `SessionStoreRegistry` and
 `SlowStartRegistry` already follow.
-
-This is the part of the proposal most worth
-arguing with, and the reason aslakknutsen is listed
-as a stakeholder.
 
 ### User Stories
 
